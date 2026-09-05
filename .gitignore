@@ -9,8 +9,9 @@ __pycache__/
 .idea/
 .vscode/
 
-# Keep only prepared training and evaluation parquet files under data/.
+# Track preparation code and prepared training/evaluation parquet files.
 /data/*
+!/data/*.py
 !/data/train/
 !/data/eval/
 /data/train/*

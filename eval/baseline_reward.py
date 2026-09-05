@@ -70,7 +70,7 @@ def compute_score(
     """verl custom-reward entrypoint."""
     del extra_info, kwargs
     if data_source == "amobench":
-        from src.amo_reward import compute_score as amo_score
+        from eval.amo_reward import compute_score as amo_score
 
         score = amo_score(solution_str, ground_truth)
         return {"score": score, "acc": score, "formatted": float(extract_last_boxed(solution_str) is not None)}

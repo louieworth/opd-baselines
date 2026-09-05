@@ -6,7 +6,7 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 
-from src.baseline_reward import compute_score as score_sync
+from eval.baseline_reward import compute_score as score_sync
 
 _pool = None
 

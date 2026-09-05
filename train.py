@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the packaged GRPO or plain OPD baseline through native verl."""
+"""Launch GRPO, OPD, TRD, OPSD, or EOPD training and evaluation through verl."""
 
 from __future__ import annotations
 
@@ -15,82 +15,22 @@ from typing import Any
 
 import yaml
 
+from src import eopd, grpo, opd, opsd, trd
+from src.config import (
+    COMMON_KEYS,
+    ROOT,
+    data_references,
+    effective_model,
+    local_path,
+    override,
+    positive_int,
+    prompt_mode,
+    strict_bool,
+)
 
-ROOT = Path(__file__).resolve().parents[1]
-METHODS = {"grpo", "opd"}
-PROMPT_MODES = {"thinking", "non-thinking", "plaint"}
-ALLOWED_KEYS = {
-    "method",
-    "model_path",
-    "auto_prepare_model",
-    "project_name",
-    "experiment_name",
-    "output_dir",
-    "use_wandb",
-    "wandb_entity",
-    "wandb_api_key",
-    "n_gpus_per_node",
-    "vllm_tensor_parallel_size",
-    "per_device_batch_size",
-    "group_size",
-    "ppo_mini_batch_size",
-    "total_training_steps",
-    "num_epochs",
-    "learning_rate",
-    "warmup_steps",
-    "weight_decay",
-    "max_grad_norm",
-    "kl_loss_coef",
-    "max_train_samples",
-    "max_prompt_length",
-    "max_completion_length",
-    "actor_max_token_len_per_gpu",
-    "temperature",
-    "top_p",
-    "top_k_sampling",
-    "mode",
-    "vllm_gpu_memory_utilization",
-    "train_files",
-    "val_files",
-    "val_before_train",
-    "eval_steps",
-    "val_max_completion_length",
-    "val_do_sample",
-    "val_n",
-    "val_temperature",
-    "val_top_p",
-    "val_top_k",
-    "val_batch_size",
-    "save_steps",
-    "teacher_model_path",
-    "teacher_enable_resource_pool",
-    "teacher_n_gpus_per_node",
-    "teacher_tp_size",
-    "teacher_gpu_memory_utilization",
-    "distillation_num_workers",
-    "distillation_loss_mode",
-    "distillation_topk",
-    "distillation_use_policy_gradient",
-    "distillation_use_task_rewards",
-    "distillation_loss_coef",
-    "distillation_loss_max_clamp",
-    "distillation_log_prob_min_clamp",
-}
-OPD_ONLY_KEYS = {
-    "teacher_model_path",
-    "teacher_enable_resource_pool",
-    "teacher_n_gpus_per_node",
-    "teacher_tp_size",
-    "teacher_gpu_memory_utilization",
-    "distillation_num_workers",
-    "distillation_loss_mode",
-    "distillation_topk",
-    "distillation_use_policy_gradient",
-    "distillation_use_task_rewards",
-    "distillation_loss_coef",
-    "distillation_loss_max_clamp",
-    "distillation_log_prob_min_clamp",
-}
+
+ALGORITHMS = {"grpo": grpo, "opd": opd, "trd": trd, "opsd": opsd, "eopd": eopd}
+ALLOWED_KEYS = COMMON_KEYS | set().union(*(algorithm.CONFIG_KEYS for algorithm in ALGORITHMS.values()))
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -113,92 +53,27 @@ def load_config(path: Path) -> dict[str, Any]:
             raise ValueError(f"{path}: wandb_api_key must be a string or null")
         payload["wandb_api_key"] = api_key.strip() or None
     method = str(payload.get("method", "")).lower()
-    if method not in METHODS:
-        raise ValueError(f"{path}: method must be one of {sorted(METHODS)}, got {method!r}")
-    if method == "grpo":
-        stray = sorted(OPD_ONLY_KEYS.intersection(payload))
-        if stray:
-            raise ValueError(f"{path}: GRPO config contains OPD-only keys: {stray}")
-    elif not payload.get("teacher_model_path"):
-        raise ValueError(f"{path}: OPD requires teacher_model_path")
+    if method not in ALGORITHMS:
+        raise ValueError(f"{path}: method must be one of {sorted(ALGORITHMS)}, got {method!r}")
+    if method != "trd" and trd.REFINE_KEYS.intersection(payload):
+        raise ValueError(f"{path}: refine_max_prompt_length requires method: trd")
+    if method != "opsd" and opsd.POINTWISE_KEYS.intersection(payload):
+        raise ValueError(f"{path}: distillation_pointwise_clip requires method: opsd")
+    if method != "eopd" and eopd.ENTROPY_KEYS.intersection(payload):
+        raise ValueError(f"{path}: eopd entropy parameters require method: eopd")
+    try:
+        ALGORITHMS[method].validate_config(payload)
+    except ValueError as exc:
+        raise ValueError(f"{path}: {exc}") from exc
+    payload["method"] = method
     payload["mode"] = prompt_mode(payload)
     return payload
 
 
-def prompt_mode(cfg: dict[str, Any]) -> str:
-    mode = cfg.get("mode", "non-thinking")
-    if not isinstance(mode, str) or mode not in PROMPT_MODES:
-        raise ValueError(f"mode must be one of {sorted(PROMPT_MODES)}, got {mode!r}")
-    return mode
-
-
-def positive_int(cfg: dict[str, Any], key: str, default: int | None = None) -> int:
-    raw = cfg.get(key, default)
-    if isinstance(raw, bool):
-        raise ValueError(f"{key} must be a positive integer, got {raw!r}")
-    try:
-        value = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{key} must be a positive integer, got {raw!r}") from exc
-    if value <= 0:
-        raise ValueError(f"{key} must be a positive integer, got {value}")
-    return value
-
-
-def strict_bool(cfg: dict[str, Any], key: str, default: bool) -> bool:
-    value = cfg.get(key, default)
-    if not isinstance(value, bool):
-        raise ValueError(f"{key} must be YAML true/false, got {value!r}")
-    return value
-
-
-def hydra_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if value is None:
-        return "null"
-    if isinstance(value, (list, dict)):
-        return json.dumps(value, separators=(",", ":"))
-    return str(value)
-
-
-def override(key: str, value: Any) -> str:
-    return f"{key}={hydra_value(value)}"
-
-
-def local_path(value: str) -> Path:
-    path = Path(value).expanduser()
-    return path.resolve() if path.is_absolute() else (ROOT / path).resolve()
-
-
-def model_reference(value: str) -> str:
-    if value.startswith(("./", "../", "/", "~")):
-        return str(local_path(value))
-    return value
-
-
-def data_references(value: Any) -> list[str]:
-    values = value if isinstance(value, list) else [value]
-    if not values:
-        raise ValueError("At least one data file is required")
-    result = []
-    for value in values:
-        path = Path(str(value))
-        if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "data":
-            raise ValueError(f"Data paths must be repo-relative under data/: {value}")
-        result.append(path.as_posix())
-    return result
-
-
-def effective_model(cfg: dict[str, Any]) -> str:
-    source = str(cfg["model_path"])
-    if strict_bool(cfg, "auto_prepare_model", True) and source == "Qwen/Qwen3-4B-Base":
-        return "./models/Qwen3-4B-Base-chatml"
-    return model_reference(source)
-
-
 def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[str]:
     method = str(cfg["method"]).lower()
+    algorithm = ALGORITHMS[method]
+    algorithm.validate_config(cfg)
     mode = prompt_mode(cfg)
     n_gpus = positive_int(cfg, "n_gpus_per_node", 8)
     tp_size = positive_int(cfg, "vllm_tensor_parallel_size", 1)
@@ -227,7 +102,7 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
     train_files = data_references(cfg["train_files"])
     val_files = data_references(cfg["val_files"])
     model_path = effective_model(cfg)
-    reward_path = "src/reward_async.py"
+    reward_path = "eval/reward_async.py"
     kl_coef = float(cfg.get("kl_loss_coef", 0.0))
     use_kl = kl_coef != 0.0
     use_wandb = strict_bool(cfg, "use_wandb", True)
@@ -236,11 +111,9 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
     command = [
         sys.executable,
         "-m",
-        "src.train",
+        "src.runtime",
         override("hydra.job.chdir", False),
         override("hydra.run.dir", run_dir / "hydra"),
-        override("algorithm.adv_estimator", "grpo"),
-        override("algorithm.use_kl_in_reward", False),
         override("trainer.use_legacy_worker_impl", "disable"),
         override("trainer.critic_warmup", 0),
         override("trainer.logger", logger),
@@ -288,7 +161,6 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
         override("actor_rollout_ref.actor.fsdp_config.model_dtype", "bf16"),
         override("actor_rollout_ref.actor.fsdp_config.param_offload", False),
         override("actor_rollout_ref.actor.fsdp_config.optimizer_offload", False),
-        override("actor_rollout_ref.actor.policy_loss.loss_mode", "vanilla"),
         override("actor_rollout_ref.rollout.temperature", float(cfg.get("temperature", 1.0))),
         override("actor_rollout_ref.rollout.top_p", float(cfg.get("top_p", 1.0))),
         override("actor_rollout_ref.rollout.top_k", int(cfg.get("top_k_sampling", -1))),
@@ -320,7 +192,7 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
     if mode == "plaint":
         command.extend(
             [
-                override("data.custom_cls.path", "pkg://src.plaint_runtime"),
+                override("data.custom_cls.path", "pkg://data.plaint_runtime"),
                 override("data.custom_cls.name", "PlaintDataset"),
                 override("actor_rollout_ref.rollout.agent.default_agent_loop", "plaint_agent"),
                 override("actor_rollout_ref.rollout.agent.agent_loop_config_path", "configs/plaint_agent.yaml"),
@@ -329,32 +201,7 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
     else:
         command.append(override("+data.apply_chat_template_kwargs.enable_thinking", mode == "thinking"))
 
-    if method == "opd":
-        command.extend(
-            [
-                override("distillation.enabled", True),
-                override("distillation.num_workers", positive_int(cfg, "distillation_num_workers", 8)),
-                override("distillation.teacher_model.enable_resource_pool", strict_bool(cfg, "teacher_enable_resource_pool", False)),
-                override("distillation.teacher_model.n_gpus_per_node", int(cfg.get("teacher_n_gpus_per_node", 0))),
-                override("distillation.teacher_model.nnodes", 1),
-                override("distillation.teacher_model.model_path", model_reference(str(cfg["teacher_model_path"]))),
-                override("distillation.teacher_model.inference.tensor_model_parallel_size", positive_int(cfg, "teacher_tp_size", 1)),
-                override("distillation.teacher_model.inference.name", "vllm"),
-                override("distillation.teacher_model.inference.gpu_memory_utilization", float(cfg.get("teacher_gpu_memory_utilization", 0.3))),
-                override("distillation.teacher_model.inference.max_model_len", train_max_seq + 1),
-                override("distillation.teacher_model.inference.max_num_batched_tokens", train_max_seq + 1),
-                override("distillation.distillation_loss.loss_mode", cfg.get("distillation_loss_mode", "k1")),
-                override("distillation.distillation_loss.topk", positive_int(cfg, "distillation_topk", 64)),
-                override("distillation.distillation_loss.use_task_rewards", strict_bool(cfg, "distillation_use_task_rewards", False)),
-                override("distillation.distillation_loss.use_policy_gradient", strict_bool(cfg, "distillation_use_policy_gradient", True)),
-                override("distillation.distillation_loss.policy_loss_mode", "vanilla"),
-                override("distillation.distillation_loss.distillation_loss_coef", float(cfg.get("distillation_loss_coef", 1.0))),
-                override("distillation.distillation_loss.loss_max_clamp", float(cfg.get("distillation_loss_max_clamp", 10.0))),
-                override("distillation.distillation_loss.log_prob_min_clamp", float(cfg.get("distillation_log_prob_min_clamp", -10.0))),
-            ]
-        )
-    else:
-        command.append(override("distillation.enabled", False))
+    command.extend(algorithm.build_overrides(cfg))
 
     for item in extra:
         key, _, value = item.partition("=")
@@ -377,10 +224,8 @@ def preflight(cfg: dict[str, Any]) -> None:
 
 def prepare_model(cfg: dict[str, Any]) -> None:
     if effective_model(cfg) == "./models/Qwen3-4B-Base-chatml" and cfg["model_path"] == "Qwen/Qwen3-4B-Base":
-        if __package__:
-            from .prepare_qwen3_base import ensure_prepared
-        else:
-            from prepare_qwen3_base import ensure_prepared
+        from data.prepare_qwen3_base import ensure_prepared
+
         ensure_prepared(ROOT / "models/Qwen3-4B-Base-chatml")
 
 
@@ -401,10 +246,11 @@ def main(argv: list[str] | None = None) -> int:
     wandb_api_key = cfg.pop("wandb_api_key", None)
     wandb_entity = cfg.get("wandb_entity") or os.environ.get("WANDB_ENTITY")
     cfg["model_path"] = os.environ.get("MODEL_PATH", str(cfg["model_path"]))
-    if cfg["method"] == "opd" and os.environ.get("TEACHER_MODEL_PATH"):
-        cfg["teacher_model_path"] = os.environ["TEACHER_MODEL_PATH"]
+    for env_name, key in ALGORITHMS[cfg["method"]].ENVIRONMENT_OVERRIDES.items():
+        if os.environ.get(env_name):
+            cfg[key] = os.environ[env_name]
     if args.eval_only:
-        cfg = {key: value for key, value in cfg.items() if key not in OPD_ONLY_KEYS}
+        cfg = {key: value for key, value in cfg.items() if key not in trd.CONFIG_KEYS | opsd.CONFIG_KEYS | eopd.CONFIG_KEYS}
         cfg["method"] = "grpo"
         cfg["experiment_name"] += "_eval"
         extra += ["trainer.val_before_train=true", "trainer.val_only=true"]
@@ -420,9 +266,12 @@ def main(argv: list[str] | None = None) -> int:
         "mode": cfg["mode"],
         "config": str(config_path),
         "run_dir": str(run_dir),
-        "distillation_enabled": cfg["method"] == "opd",
+        "distillation_enabled": cfg["method"] in {"opd", "trd", "opsd", "eopd"},
+        "teacher_refinement_enabled": cfg["method"] == "trd",
         "teacher_model": cfg.get("teacher_model_path"),
-        "policy_loss": "vanilla",
+        "policy_loss": "direct_reverse_kl_topk" if cfg["method"] == "opsd" else "vanilla",
+        "topk_reverse_kl_enabled": cfg["method"] in {"opd", "trd", "eopd"} and opd.uses_topk_k1(cfg),
+        "entropy_aware_reverse_kl_enabled": cfg["method"] == "eopd",
         "wandb_enabled": cfg.get("use_wandb", True),
         "wandb_entity": wandb_entity,
         "wandb_mode": os.environ.get("WANDB_MODE", "online"),

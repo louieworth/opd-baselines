@@ -21,6 +21,7 @@ REWRITTEN = {"tokenizer_config.json", "generation_config.json", "config.json"}
 EOS_TOKEN = "<|im_end|>"
 NATIVE_EOS_TOKEN = "<|endoftext|>"
 PAD_TOKEN = "<|fim_pad|>"
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def read_json(path: Path) -> dict:
@@ -161,6 +162,7 @@ def main() -> int:
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
+    os.chdir(ROOT)
     snapshot = Path(
         snapshot_download(
             repo_id=args.source,

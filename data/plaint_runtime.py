@@ -3,7 +3,7 @@
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
-from src.prompt_modes import PlaintAgentMixin, PlaintDatasetMixin
+from data.prompt_modes import PlaintAgentMixin, PlaintDatasetMixin
 
 
 class PlaintDataset(PlaintDatasetMixin, RLHFDataset):

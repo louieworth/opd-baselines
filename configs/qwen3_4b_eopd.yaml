@@ -1,10 +1,10 @@
-method: opd
+method: eopd
 model_path: Qwen/Qwen3-4B-Base
 auto_prepare_model: true
 
 project_name: opd
-experiment_name: qwen3_4b_opd
-output_dir: ./outputs/qwen3_4b/opd
+experiment_name: qwen3_4b_eopd
+output_dir: ./outputs/qwen3_4b/eopd
 use_wandb: true
 # Set an account/team name, or leave null to use WANDB_ENTITY or the W&B default.
 wandb_entity: null
@@ -46,7 +46,7 @@ teacher_gpu_memory_utilization: 0.3
 distillation_num_workers: 8
 distillation_loss_mode: k1
 # null: vanilla sampled k1; positive integer: conditional top-k reverse KL + PPO.
-distillation_topk: null
+distillation_topk: 16
 distillation_use_policy_gradient: true
 distillation_use_task_rewards: false
 distillation_loss_coef: 1.0
@@ -70,3 +70,8 @@ val_top_k: 20
 val_batch_size: 16
 
 save_steps: 25
+
+# Reverse-KL variant: top-k k1/PPO plus direct RKL on high-entropy positions.
+# Entropy is approximated using the renormalized teacher top-16 distribution.
+eopd_entropy_threshold: 0.8
+eopd_aux_loss_coef: 1.0

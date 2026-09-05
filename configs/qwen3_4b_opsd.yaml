@@ -1,16 +1,16 @@
-method: opd
+method: opsd
 model_path: Qwen/Qwen3-4B-Base
 auto_prepare_model: true
 
 project_name: opd
-experiment_name: qwen3_4b_opd
-output_dir: ./outputs/qwen3_4b/opd
+experiment_name: qwen3_4b_opsd
+output_dir: ./outputs/qwen3_4b/opsd
 use_wandb: true
 # Set an account/team name, or leave null to use WANDB_ENTITY or the W&B default.
 wandb_entity: null
 wandb_api_key: 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
 
-# 4 GPUs x 256 prompts x 1 sample = 1,024 rollouts per step.
+# 8 GPUs x 128 prompts x 1 sample = 1,024 rollouts per step.
 n_gpus_per_node: 8
 vllm_tensor_parallel_size: 1
 per_device_batch_size: 128
@@ -37,21 +37,20 @@ mode: plaint  # thinking | non-thinking | plaint; shared by train and eval
 
 vllm_gpu_memory_utilization: 0.6
 
-# Native verl external-teacher distillation.
+# External-teacher reverse KL with pointwise clipping on teacher top-k.
 teacher_model_path: Qwen/Qwen3-30B-A3B-Instruct-2507
 teacher_enable_resource_pool: false
 teacher_n_gpus_per_node: 8
 teacher_tp_size: 4
 teacher_gpu_memory_utilization: 0.3
 distillation_num_workers: 8
-distillation_loss_mode: k1
-# null: vanilla sampled k1; positive integer: conditional top-k reverse KL + PPO.
-distillation_topk: null
-distillation_use_policy_gradient: true
+distillation_loss_mode: reverse_kl_topk
+distillation_topk: 64
+distillation_use_policy_gradient: false
 distillation_use_task_rewards: false
 distillation_loss_coef: 1.0
-distillation_loss_max_clamp: 10.0
-distillation_log_prob_min_clamp: -10.0
+distillation_loss_max_clamp: null
+distillation_log_prob_min_clamp: null
 
 train_files: data/train/dapo_math_17k.parquet
 val_files:
@@ -70,3 +69,7 @@ val_top_k: 20
 val_batch_size: 16
 
 save_steps: 25
+
+# Upper-clip each vocabulary contribution before summing teacher top-k.
+# null disables pointwise clipping; retained probabilities are not renormalized.
+distillation_pointwise_clip: 0.05
