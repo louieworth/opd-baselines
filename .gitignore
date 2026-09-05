@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+.venv/
+.pytest_cache/
+.env
+.idea/
+.vscode/
+
+# Keep only prepared training and evaluation parquet files under data/.
+/data/*
+!/data/train/
+!/data/eval/
+/data/train/*
+!/data/train/*.parquet
+/data/eval/*
+!/data/eval/*.parquet
+/MANIFEST.sha256
+/models/
+/outputs/
+/wandb/
+/tmp/
+tests
+*.log
+.DS_Store

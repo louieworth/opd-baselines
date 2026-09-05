@@ -1,0 +1,57 @@
+method: grpo
+model_path: Qwen/Qwen3-4B-Base
+auto_prepare_model: true
+
+project_name: opd
+experiment_name: qwen3_4b_grpo_mode_thinking
+output_dir: ./outputs/qwen3_4b/grpo/mode_thinking
+use_wandb: true
+# Optional API key; null uses WANDB_API_KEY or saved W&B login.
+wandb_api_key: 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
+# Set an account/team name, or leave null to use WANDB_ENTITY or the W&B default.
+wandb_entity: null
+
+# 4 GPUs x 32 prompts x 8 samples = 1,024 rollouts per step.
+n_gpus_per_node: 8
+vllm_tensor_parallel_size: 1
+per_device_batch_size: 16
+group_size: 8
+ppo_mini_batch_size: 128
+total_training_steps: 300
+num_epochs: 30
+
+learning_rate: 1.0e-6
+warmup_steps: 25
+weight_decay: 0.01
+max_grad_norm: 1.0
+kl_loss_coef: 0.0
+
+max_train_samples: 100000
+max_prompt_length: 2048
+max_completion_length: 16384
+actor_max_token_len_per_gpu: 40960
+
+temperature: 1.0
+top_p: 1.0
+top_k_sampling: -1
+mode: thinking  # thinking | non-thinking | plaint; shared by train and eval
+
+vllm_gpu_memory_utilization: 0.6
+
+train_files: data/train/dapo_math_17k.parquet
+val_files:
+  - data/eval/aime25.parquet
+  - data/eval/aime26.parquet
+  - data/eval/amobench.parquet
+  - data/eval/hmmt26.parquet
+val_before_train: true
+eval_steps: 25
+val_max_completion_length: 16384
+val_do_sample: true
+val_n: 12
+val_temperature: 0.7
+val_top_p: 0.8
+val_top_k: 20
+val_batch_size: 16
+
+save_steps: 25
