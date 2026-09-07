@@ -7,13 +7,15 @@ from __future__ import annotations
 import json
 
 from math_verify import parse, verify
+from math_verify.errors import TimeoutException
 from math_verify.utils import timeout
 from sympy import solve
 
 
-@timeout(30)
+@timeout(60)
 def solve_with_timeout(expression):
     return solve(expression)
+
 
 ANSWER_PREFIX_LIST = [
     "### the final answer is:",
@@ -206,7 +208,8 @@ def compute_score(solution_str, ground_truth) -> float:
             result = verify_number_set_answer(pred_extract, answer)
         else:
             result = verify_variable_answer(pred_extract, answer, ground_truth.get("try_list", []))
-    except Exception:
+    except (Exception, TimeoutException):
+        # Math-Verify timeouts inherit BaseException; keep grading failures local.
         result = False
 
     if not result:
@@ -216,7 +219,7 @@ def compute_score(solution_str, ground_truth) -> float:
                 result = verify_number_set_answer(pred_extract_cut, answer)
             else:
                 result = verify_variable_answer(pred_extract_cut, answer, ground_truth.get("try_list", []))
-        except Exception:
+        except (Exception, TimeoutException):
             result = False
 
     return 1.0 if result else 0.0
