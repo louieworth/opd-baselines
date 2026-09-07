@@ -181,7 +181,13 @@ class Tracking:
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                backend_data = data
+                if default_backend == "wandb":
+                    backend_data = {
+                        key: value for key, value in data.items()
+                        if not (key.startswith("eval/") and key.endswith("/num_questions"))
+                    }
+                logger_instance.log(data=backend_data, step=step)
 
     def __enter__(self):
         return self
