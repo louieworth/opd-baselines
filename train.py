@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -91,12 +92,14 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
         )
 
     max_prompt = positive_int(cfg, "max_prompt_length", 2048)
+    val_max_prompt = positive_int(cfg, "val_max_prompt_length", max_prompt)
     max_response = positive_int(cfg, "max_completion_length", 8192)
     val_max_response = positive_int(cfg, "val_max_completion_length", max_response)
     if val_max_response != max_response:
         raise ValueError("This native verl rollout requires equal train and validation response lengths")
     train_max_seq = max_prompt + max_response
-    rollout_max_len = max(train_max_seq, max_prompt + val_max_response)
+    rollout_prompt_length = max(max_prompt, val_max_prompt)
+    rollout_max_len = max(train_max_seq, val_max_prompt + val_max_response)
     actor_token_budget = positive_int(cfg, "actor_max_token_len_per_gpu", train_max_seq)
 
     train_files = data_references(cfg["train_files"])
@@ -135,6 +138,7 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
         override("data.val_batch_size", positive_int(cfg, "val_batch_size", 16)),
         override("data.train_max_samples", positive_int(cfg, "max_train_samples", 100000)),
         override("data.max_prompt_length", max_prompt),
+        override("+data.val_max_prompt_length", val_max_prompt),
         override("data.max_response_length", max_response),
         override("+data.prompt_mode", mode),
         override("data.filter_overlong_prompts", True),
@@ -174,8 +178,9 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
         override("actor_rollout_ref.rollout.load_format", "safetensors"),
         override("actor_rollout_ref.rollout.layered_summon", True),
         override("actor_rollout_ref.rollout.max_model_len", rollout_max_len),
-        override("actor_rollout_ref.rollout.max_num_batched_tokens", max_prompt + val_max_response),
-        override("actor_rollout_ref.rollout.val_kwargs.n", positive_int(cfg, "val_n", 1)),
+        override("actor_rollout_ref.rollout.prompt_length", rollout_prompt_length),
+        override("actor_rollout_ref.rollout.max_num_batched_tokens", rollout_prompt_length + val_max_response),
+        override("actor_rollout_ref.rollout.val_kwargs.n", positive_int(cfg, "val_n", 8)),
         override("actor_rollout_ref.rollout.val_kwargs.do_sample", strict_bool(cfg, "val_do_sample", True)),
         override("actor_rollout_ref.rollout.val_kwargs.temperature", float(cfg.get("val_temperature", 0.7))),
         override("actor_rollout_ref.rollout.val_kwargs.top_p", float(cfg.get("val_top_p", 0.8))),
@@ -234,7 +239,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("config", type=Path)
     parser.add_argument("--dry-run", action="store_true", help="validate and print the Hydra command without launching")
     parser.add_argument("--eval-only", action="store_true", help="evaluate the student without training or a teacher")
+    parser.add_argument("--checkpoint", type=Path, help="saved global_step_N directory; requires --eval-only")
+    parser.add_argument(
+        "--benchmarks", nargs="+", choices=["aime25", "aime26", "hmmt26", "amobench", "mbppplus", "gpqa_diamond"],
+        help="select validation benchmarks instead of the config's val_files",
+    )
     args, extra = parser.parse_known_args(argv)
+    if args.checkpoint and not args.eval_only:
+        parser.error("--checkpoint requires --eval-only")
+    checkpoint = None
+    if args.checkpoint:
+        path = args.checkpoint.expanduser()
+        checkpoint = path.resolve() if path.exists() else local_path(str(path))
+        if checkpoint.name == "actor":
+            checkpoint = checkpoint.parent
+        if not re.fullmatch(r"global_step_\d+", checkpoint.name):
+            parser.error("--checkpoint must name a global_step_N directory (or its actor subdirectory)")
+        if not args.dry_run and not (checkpoint / "actor").is_dir():
+            parser.error(f"checkpoint actor directory does not exist: {checkpoint / 'actor'}")
     if extra and extra[0] == "--":
         extra = extra[1:]
     if any("=" not in item for item in extra):
@@ -242,6 +264,8 @@ def main(argv: list[str] | None = None) -> int:
 
     config_path = args.config.resolve() if args.config.exists() else ROOT / args.config
     cfg = load_config(config_path)
+    if args.benchmarks:
+        cfg["val_files"] = [f"data/eval/{name}.parquet" for name in dict.fromkeys(args.benchmarks)]
     # Credentials never enter the saved recipe or the Hydra command/config.
     wandb_api_key = cfg.pop("wandb_api_key", None)
     wandb_entity = cfg.get("wandb_entity") or os.environ.get("WANDB_ENTITY")
@@ -254,6 +278,13 @@ def main(argv: list[str] | None = None) -> int:
         cfg["method"] = "grpo"
         cfg["experiment_name"] += "_eval"
         extra += ["trainer.val_before_train=true", "trainer.val_only=true"]
+    if checkpoint:
+        extra += [
+            "trainer.resume_mode=resume_path",
+            override("trainer.resume_from_path", checkpoint),
+            'actor_rollout_ref.actor.checkpoint.load_contents=["model"]',
+            "trainer.del_local_ckpt_after_load=false",
+        ]
     output_root = Path(str(cfg.get("output_dir", f"./outputs/{cfg['method']}")))
     if output_root.is_absolute() or ".." in output_root.parts:
         raise ValueError("output_dir must be repo-relative")
@@ -276,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
         "wandb_entity": wandb_entity,
         "wandb_mode": os.environ.get("WANDB_MODE", "online"),
         "eval_only": args.eval_only,
+        "checkpoint": str(checkpoint) if checkpoint else None,
     }
     print(json.dumps(summary, indent=2))
     print(shlex.join(command))

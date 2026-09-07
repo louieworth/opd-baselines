@@ -1,7 +1,7 @@
 # GRPO, OPD, TRD, OPSD, and EOPD training baselines
 
 Portable Qwen3-4B-Base recipes with prepared train/test data, automatic Hugging
-Face model preparation, and per-benchmark `pass@12` and `avg@12` evaluation.
+Face model preparation, and per-benchmark `pass@8` and `avg@8` evaluation.
 Copy this repository, including `data/train/` and `data/eval/`, to the training
 platform. Dataset files are regular files with repository-relative paths.
 Preparation code and the prepared Parquet files under `data/train/` and
@@ -300,7 +300,7 @@ The OPD config uses `mode: plaint`; the original GRPO config uses
 mode: plaint
 ```
 
-The plain prompt is:
+The plain prompt for math is:
 
 ```text
 {question}
@@ -313,6 +313,8 @@ hint. `plaint` adds no user/assistant delimiters or `<think>` block. Prompt-leng
 filtering and rollout use the same direct tokenization, without changing the
 prepared Parquet files. The mode is included in the printed launch summary and
 the W&B configuration as `data.prompt_mode`.
+MBPP+ retains its Python code-block instruction, and GPQA-Diamond retains its
+boxed answer-letter instruction, in all three modes.
 
 GRPO also has a separate config for each mode:
 
@@ -335,6 +337,8 @@ under `outputs/qwen3_4b/grpo/mode_<mode>/`.
 | AIME26 | `data/eval/aime26.parquet` | 30 |
 | HMMT February 2026 | `data/eval/hmmt26.parquet` | 33 |
 | AMO-Bench-P | `data/eval/amobench.parquet` | 39 |
+| MBPP+ v0.2.0 | `data/eval/mbppplus.parquet` | 378 |
+| GPQA-Diamond | `data/eval/gpqa_diamond.parquet` | 198 |
 
 The pinned DAPO source has 17,917 rows. One question exactly matches an AIME26
 question after case folding and whitespace removal, so it is excluded from
@@ -353,7 +357,8 @@ python data/prepare_data.py --rebuild  # Regenerate using pinned sources/cache.
 `data/prepare_data.py` contains test-data conversion for all four benchmarks
 and calls `data/build_dapo_math_17k.py` for training data after the test files
 are prepared. The latter still works on its own and removes overlaps against
-evaluation files already present. Use the unified script to prepare all five
+evaluation files already present. The unified script also calls
+`data/prepare_code_science.py`. Use it to prepare all seven
 Parquet files. Raw caches live under `data/raw/` and are ignored by Git.
 Training and evaluation run offline
 with respect to datasets. HF model downloads still need network access.
@@ -368,20 +373,61 @@ and startup dataset checks are not used. Sources:
 Dataset rights remain with their sources. Local source notices under
 `data/notices/` are ignored by Git and are not required by the launchers.
 
+### Code and science data
+
+```bash
+# Prepare only the two additional evaluation datasets, without CUDA or EvalPlus.
+pip install -r requirements-data.txt
+python data/prepare_code_science.py
+python data/prepare_code_science.py --rebuild
+```
+
+The preparation script pins the official
+[MBPP+ release](https://github.com/evalplus/mbppplus_release/releases/tag/v0.2.0)
+and [GPQA repository revision](https://github.com/idavidrein/gpqa/tree/56686c06f5e19865c153de0fdb11be3890014df7),
+verifies download SHA256 checksums, and stores source metadata in each Parquet.
+This MBPP+ artifact contains 378 tasks. GPQA-Diamond contains all 198 questions;
+option indices are shuffled with seed 0 and a stable question ID. The source's
+repeated incorrect options are preserved. GPQA data is by Irving David Rein,
+licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+
+MBPP+ includes the reference implementations and original/expanded test inputs
+in the grader's `ground_truth` field, so evaluation needs no dataset download.
+They are excluded from generation prompts. GPQA prompts contain only the
+question, shuffled choices, and answer instructions. These are evaluation-only
+datasets; training data remains DAPO-Math-17k.
+
 ## Evaluation
 
-Both recipes evaluate before training and every 25 steps, including the last
-step. Every evaluation generates 12 answers per question across all four
-benchmarks, for 1,584 answers total. Defaults are temperature 0.7, top-p 0.8,
+All packaged recipes evaluate before training and every 25 steps, including the last
+step. Every evaluation generates 8 answers per question across all six
+benchmarks, for 5,664 answers total. Defaults are temperature 0.7, top-p 0.8,
 top-k 20, and a 16,384-token completion limit.
 
-- `pass@12`: fraction of questions with at least one correct answer among 12.
-- `avg@12`: mean correct-answer fraction across the 12 samples per question.
+- `pass@8`: fraction of questions with at least one correct answer among 8.
+- `avg@8`: mean correct-answer fraction across the 8 samples per question.
 
 Values are in `[0, 1]`. Exact observed successes are used, without bootstrap
 resampling. AIME and HMMT use boxed-answer Math-Verify grading. AMO uses its
 parser protocol, including set comparison and the official variable probes.
 Grading runs in separate CPU processes so parser timeouts work under verl.
+MBPP+ uses pinned EvalPlus 0.3.1 input deserialization, sanitization, special
+oracles, and subprocess execution. A solution passes only if both the base and
+expanded tests pass. `eval/mbppplus/pass@1` is the sample-average pass rate,
+equal to `avg@8` with the default 8 samples. GPQA-Diamond uses final-letter
+exact matching and additionally records `eval/gpqa_diamond/accuracy`, also equal
+to `avg@8`. These are sampled scores, not greedy single-generation results.
+Thinking blocks and ambiguous answers receive no final-answer credit.
+
+EvalPlus executes generated Python in temporary subprocesses with its default
+time/memory limits; code sanitization has a 10-second limit. Use an isolated
+Linux evaluation environment since EvalPlus's reliability guard is not a full
+security sandbox. A known-correct execution probe fails the run if the execution
+environment is broken. The loader also rejects MBPP+/GPQA evaluations that lose
+questions to prompt filtering or sample limits; increase `val_max_prompt_length`
+if the error reports filtered questions. Packaged recipes use 4,096 tokens for
+validation prompts to retain the longest GPQA question, while training prompt
+filtering remains at 2,048. The shared rollout engine reserves the larger context.
 
 To evaluate without training or loading an OPD teacher:
 
@@ -397,6 +443,39 @@ bash eval/eval.sh --dry-run
 
 Use an HF-format checkpoint for `MODEL_PATH`. The eval-only path initializes
 verl's student workers and still requires the configured CUDA GPUs.
+
+To evaluate an existing native verl checkpoint, use its original recipe and the
+same GPU count used when saving the FSDP shards. No HF export is required:
+
+```bash
+pip install 'evalplus==0.3.1' 'tree-sitter==0.24.0' 'tree-sitter-python==0.23.6'
+
+# Evaluate just MBPP+ and GPQA-Diamond at step 25. Replace RUN with your run directory.
+python train.py configs/qwen3_4b_opd.yaml --eval-only \
+  --checkpoint outputs/qwen3_4b/opd/RUN/global_step_25 \
+  --benchmarks mbppplus gpqa_diamond
+
+# Inspect the command without loading weights or claiming GPUs.
+python train.py configs/qwen3_4b_opd.yaml --eval-only --dry-run \
+  --checkpoint outputs/qwen3_4b/opd/RUN/global_step_25 \
+  --benchmarks mbppplus gpqa_diamond
+
+# Evaluate every saved checkpoint in a run, in numeric step order.
+for step in $(find outputs/qwen3_4b/opd/RUN -maxdepth 1 -type d \
+  -name 'global_step_*' | sed 's/.*global_step_//' | sort -n); do
+  python train.py configs/qwen3_4b_opd.yaml --eval-only \
+    --checkpoint "outputs/qwen3_4b/opd/RUN/global_step_${step}" \
+    --benchmarks mbppplus gpqa_diamond || break
+done
+```
+
+`--checkpoint` restores actor weights and the checkpoint step, disables the
+teacher and training updates, and leaves the source checkpoint intact. Results
+go into a new evaluation run directory, with `eval_metrics/25.json` and
+`validation/25.jsonl` for step 25. Omit `--benchmarks` to evaluate all configured
+benchmarks. The same selection flag can restrict periodic validation during
+training. Newly started training runs automatically include both datasets at
+steps 25, 50, 75, etc.; a process already running uses its original configuration.
 
 Metrics are written to `outputs/qwen3_4b/<method>/<run>/eval_metrics/<step>.json`.
 Sample outputs are saved under the run's `validation/` directory. Checkpoints,

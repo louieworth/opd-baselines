@@ -23,6 +23,7 @@ __pycache__/
 /outputs/
 /wandb/
 /tmp/
-tests
+/tests/*
+!/tests/test_code_science.py
 *.log
 .DS_Store

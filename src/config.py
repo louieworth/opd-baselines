@@ -45,6 +45,7 @@ COMMON_KEYS = {
     "val_before_train",
     "eval_steps",
     "val_max_completion_length",
+    "val_max_prompt_length",
     "val_do_sample",
     "val_n",
     "val_temperature",

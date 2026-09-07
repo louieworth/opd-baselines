@@ -1,4 +1,4 @@
-"""Run symbolic grading in process main threads so Math-Verify timeouts work."""
+"""Run math, science, and code grading in separate process main threads."""
 
 import asyncio
 import atexit

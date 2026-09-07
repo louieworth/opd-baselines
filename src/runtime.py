@@ -9,12 +9,23 @@ from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.trainer import main_ppo
 from verl.utils.device import auto_set_device
 
+from data.prompt_modes import dataset_prompt_config
 from eval.trainer import BaselineTrainer
 from src.config import ROOT
 from src.eopd import EOPDMixin
 from src.opd import OPDTopKMixin
 from src.opsd import OPSDLossMixin
 from src.trd import TRDTrajectoryMixin
+
+
+_native_create_rl_dataset = main_ppo.create_rl_dataset
+
+
+def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples=-1):
+    return _native_create_rl_dataset(
+        data_paths, dataset_prompt_config(data_config, is_train=is_train), tokenizer, processor,
+        is_train=is_train, max_samples=max_samples,
+    )
 
 
 class OPDTrainer(OPDTopKMixin, BaselineTrainer):
@@ -37,6 +48,7 @@ class BaselineTaskRunner(main_ppo.TaskRunner):
     def run(self, config):
         # Install the trainer only within this recipe's Ray driver process.
         os.chdir(ROOT)
+        main_ppo.create_rl_dataset = create_rl_dataset
         if config.get("opsd", {}).get("enabled", False):
             main_ppo.RayPPOTrainer = OPSDTrainer
         elif config.get("eopd", {}).get("enabled", False):

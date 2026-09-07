@@ -94,6 +94,11 @@ def main() -> int:
         build(fetch_source(Path("data/raw/thunlp_opd")), train)
     else:
         print(f"Using {train}")
+    if __package__:
+        from .prepare_code_science import prepare
+    else:
+        from prepare_code_science import prepare
+    prepare(rebuild=args.rebuild)
     return 0
 
 

@@ -4,7 +4,7 @@ from collections import defaultdict
 from math import isfinite
 
 
-def compute_eval_metrics(data_sources, sample_uids, scores, k=12):
+def compute_eval_metrics(data_sources, sample_uids, scores, k=8):
     if k <= 0 or not (len(data_sources) == len(sample_uids) == len(scores)):
         raise ValueError("Invalid k or misaligned evaluation results")
     groups = defaultdict(lambda: defaultdict(list))
@@ -24,4 +24,8 @@ def compute_eval_metrics(data_sources, sample_uids, scores, k=12):
         metrics[f"eval/{source}/avg@{k}"] = sum(sum(v) / k for v in questions.values()) / n
         metrics[f"eval/{source}/pass@{k}"] = sum(max(v) for v in questions.values()) / n
         metrics[f"eval/{source}/num_questions"] = n
+        if source == "mbppplus":
+            metrics[f"eval/{source}/pass@1"] = metrics[f"eval/{source}/avg@{k}"]
+        elif source == "gpqa_diamond":
+            metrics[f"eval/{source}/accuracy"] = metrics[f"eval/{source}/avg@{k}"]
     return metrics

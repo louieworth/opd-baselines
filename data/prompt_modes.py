@@ -2,10 +2,24 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 
 ANSWER_INSTRUCTION = r"Please reason step by step, and put your final answer within \boxed{}."
+CODE_ANSWER_INSTRUCTION = "Return a complete Python solution in a single ```python code block."
+CHOICE_ANSWER_INSTRUCTION = (
+    r"Please reason step by step, and put only the final answer letter (A, B, C, or D) within \boxed{}."
+)
+
+
+def dataset_prompt_config(config, *, is_train: bool):
+    """Give validation its own prompt limit without changing training filtering."""
+    if is_train or config.get("val_max_prompt_length") is None:
+        return config
+    result = deepcopy(config)
+    result["max_prompt_length"] = config["val_max_prompt_length"]
+    return result
 
 
 def plaint_prompt(messages: list[dict[str, Any]]) -> str:
@@ -16,6 +30,8 @@ def plaint_prompt(messages: list[dict[str, Any]]) -> str:
     if not isinstance(content, str):
         raise ValueError("plaint mode requires a text question")
     question = content.strip()
+    if question.endswith((CODE_ANSWER_INSTRUCTION, CHOICE_ANSWER_INSTRUCTION)):
+        return question
     if question.endswith(ANSWER_INSTRUCTION):
         question = question[: -len(ANSWER_INSTRUCTION)].rstrip()
     return f"{question}\n{ANSWER_INSTRUCTION}"

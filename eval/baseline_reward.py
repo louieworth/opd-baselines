@@ -69,6 +69,10 @@ def compute_score(
 ) -> dict[str, float]:
     """verl custom-reward entrypoint."""
     del extra_info, kwargs
+    if data_source in {"mbppplus", "gpqa_diamond"}:
+        from eval.code_science_reward import score_gpqa, score_mbpp
+
+        return (score_mbpp if data_source == "mbppplus" else score_gpqa)(solution_str, ground_truth)
     if data_source == "amobench":
         from eval.amo_reward import compute_score as amo_score
 

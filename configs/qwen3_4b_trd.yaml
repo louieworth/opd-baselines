@@ -58,12 +58,15 @@ val_files:
   - data/eval/aime25.parquet
   - data/eval/aime26.parquet
   - data/eval/amobench.parquet
+  - data/eval/mbppplus.parquet
+  - data/eval/gpqa_diamond.parquet
   - data/eval/hmmt26.parquet
 val_before_train: true
 eval_steps: 25
+val_max_prompt_length: 4096
 val_max_completion_length: 16384
 val_do_sample: true
-val_n: 12
+val_n: 8
 val_temperature: 0.7
 val_top_p: 0.8
 val_top_k: 20
