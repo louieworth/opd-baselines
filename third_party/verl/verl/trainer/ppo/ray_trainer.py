@@ -1298,13 +1298,16 @@ class RayPPOTrainer:
 
         from verl.utils.tracking import Tracking
 
-        logger = Tracking(
+        with Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
-        )
+        ) as logger:
+            return self._fit_with_logger(logger)
 
+    def _fit_with_logger(self, logger):
+        """Run training while the caller owns tracking and its final exit status."""
         self.global_steps = 0
 
         # load checkpoint and update weights before doing anything

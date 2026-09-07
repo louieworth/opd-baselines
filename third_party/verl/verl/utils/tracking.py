@@ -183,21 +183,44 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is not None:
+            # Ray catches task exceptions, so W&B's process-exit hook cannot
+            # reliably infer that training failed. Log before closing the run.
+            logger.error("Experiment failed", exc_info=(exc_type, exc_value, traceback))
+        try:
+            self.finish(exit_code=0 if exc_type is None else 1)
+        except Exception:
+            if exc_type is None:
+                raise
+            logger.exception("Failed to close experiment tracking while handling an error")
+        return False
+
+    def finish(self, exit_code=0):
+        """Close backends once, preserving the caller's success or failure status."""
+        loggers = getattr(self, "logger", {})
+        self.logger = {}
+        if "wandb" in loggers:
+            loggers["wandb"].finish(exit_code=exit_code)
+        if "swanlab" in loggers:
+            loggers["swanlab"].finish()
+        if "vemlp_wandb" in loggers:
+            loggers["vemlp_wandb"].finish(exit_code=exit_code)
+        if "tensorboard" in loggers:
+            loggers["tensorboard"].finish()
+        if "clearml" in loggers:
+            loggers["clearml"].finish()
+        if "trackio" in loggers:
+            loggers["trackio"].finish()
+        if "file" in loggers:
+            loggers["file"].finish()
+
     def __del__(self):
-        if "wandb" in self.logger:
-            self.logger["wandb"].finish(exit_code=0)
-        if "swanlab" in self.logger:
-            self.logger["swanlab"].finish()
-        if "vemlp_wandb" in self.logger:
-            self.logger["vemlp_wandb"].finish(exit_code=0)
-        if "tensorboard" in self.logger:
-            self.logger["tensorboard"].finish()
-        if "clearml" in self.logger:
-            self.logger["clearml"].finish()
-        if "trackio" in self.logger:
-            self.logger["trackio"].finish()
-        if "file" in self.logger:
-            self.logger["file"].finish()
+        # Compatibility for callers that do not yet manage Tracking explicitly.
+        self.finish()
 
 
 class ClearMLLogger:
