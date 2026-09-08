@@ -54,7 +54,9 @@ def validate_config(cfg: dict[str, Any]) -> None:
 
 def build_overrides(cfg: dict[str, Any]) -> list[str]:
     validate_config(cfg)
-    train_max_seq = positive_int(cfg, "max_prompt_length", 2048) + positive_int(cfg, "max_completion_length", 8192)
+    prompt_length = positive_int(cfg, "max_prompt_length", 2048)
+    response_length = positive_int(cfg, "max_completion_length", 8192)
+    train_max_seq = prompt_length + response_length
     loss_clamp = cfg.get("distillation_loss_max_clamp", 10.0)
     log_prob_clamp = cfg.get("distillation_log_prob_min_clamp", -10.0)
     overrides = [
@@ -70,6 +72,8 @@ def build_overrides(cfg: dict[str, Any]) -> list[str]:
         override("distillation.teacher_model.inference.tensor_model_parallel_size", positive_int(cfg, "teacher_tp_size", 1)),
         override("distillation.teacher_model.inference.name", "vllm"),
         override("distillation.teacher_model.inference.gpu_memory_utilization", float(cfg.get("teacher_gpu_memory_utilization", 0.3))),
+        override("distillation.teacher_model.inference.prompt_length", prompt_length),
+        override("distillation.teacher_model.inference.response_length", response_length),
         override("distillation.teacher_model.inference.max_model_len", train_max_seq + 1),
         override("distillation.teacher_model.inference.max_num_batched_tokens", train_max_seq + 1),
         override("distillation.distillation_loss.loss_mode", "reverse_kl_topk" if uses_topk_k1(cfg) else cfg.get("distillation_loss_mode", "k1")),
@@ -140,7 +144,8 @@ def topk_k1_terms(student_logps, teacher_logps, old_logps, *, signal_clip=10.0,
     }
 
 
-def topk_k1_loss(*, config, distillation_config, student_logits=None, model_output=None, data=None, dp_group=None):
+def topk_k1_loss(*, config, distillation_config, student_logits=None, model_output=None, data=None, dp_group=None,
+                 auxiliary_terms=None):
     """FSDP logits callback and final loss callback, using native actor updates."""
     import torch
     from verl.utils import tensordict_utils as tu
@@ -149,6 +154,7 @@ def topk_k1_loss(*, config, distillation_config, student_logits=None, model_outp
     loss_config = distillation_config.distillation_loss
     if student_logits is not None:
         from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size, slice_input_tensor
+        from src.topk import selected_log_probs
 
         ids = data["teacher_ids"].values().unsqueeze(0)
         teacher_logps = data["teacher_logprobs"].values().unsqueeze(0)
@@ -161,7 +167,7 @@ def topk_k1_loss(*, config, distillation_config, student_logits=None, model_outp
         if ids.shape != teacher_logps.shape or ids.shape[:2] != student_logits.shape[:2]:
             raise ValueError("OPD top-k teacher probabilities must align with packed student logits")
         # Normalize student logits over exactly the same teacher-selected support.
-        student_logps = student_logits.gather(-1, ids.long()).float().log_softmax(-1)
+        student_logps = selected_log_probs(student_logits, ids)
         if scoring:
             # verl's FSDP output interface expects one scalar per sequence position.
             return {f"opd_old_topk_{i}": student_logps[..., i].contiguous() for i in range(ids.shape[-1])}
@@ -175,6 +181,8 @@ def topk_k1_loss(*, config, distillation_config, student_logits=None, model_outp
             dual_clip=loss_config.get("clip_ratio_c", 3.0),
         )
         output["topk_teacher_mass"] = teacher_logps.detach().exp().sum(-1)
+        if auxiliary_terms is not None:
+            output.update(auxiliary_terms(student_logps, teacher_logps))
         return output
 
     if scoring:

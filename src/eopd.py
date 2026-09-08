@@ -71,21 +71,12 @@ def eopd_loss(*, config, distillation_config, entropy_threshold, aux_loss_coef,
               student_logits=None, model_output=None, data=None, dp_group=None):
     from verl.utils import tensordict_utils as tu
 
-    # Reuse the same candidate PPO loss and old-probability scoring callback.
+    # Both losses share one top-k selection and its dense vocabulary gradient.
+    # Scoring returns before this auxiliary callback is evaluated.
     base = opd.topk_k1_loss(config=config, distillation_config=distillation_config,
-                            student_logits=student_logits, model_output=model_output, data=data, dp_group=dp_group)
-    if tu.get_non_tensor_data(data, "opd_topk_scoring", False):
-        return base
-    if student_logits is not None:
-        from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size, slice_input_tensor
-
-        ids = data["teacher_ids"].values().unsqueeze(0)
-        teacher_logps = data["teacher_logprobs"].values().unsqueeze(0)
-        if get_ulysses_sequence_parallel_world_size() > 1:
-            ids = slice_input_tensor(ids, dim=1)
-            teacher_logps = slice_input_tensor(teacher_logps, dim=1)
-        student_logps = student_logits.gather(-1, ids.long()).float().log_softmax(-1)
-        base.update(entropy_reverse_kl_terms(student_logps, teacher_logps, entropy_threshold))
+                            student_logits=student_logits, model_output=model_output, data=data, dp_group=dp_group,
+                            auxiliary_terms=partial(entropy_reverse_kl_terms, threshold=entropy_threshold))
+    if tu.get_non_tensor_data(data, "opd_topk_scoring", False) or student_logits is not None:
         return base
 
     from verl.trainer.ppo.core_algos import agg_loss

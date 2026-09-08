@@ -15,7 +15,7 @@ from src.config import ROOT
 from src.eopd import EOPDMixin
 from src.opd import OPDTopKMixin
 from src.opsd import OPSDLossMixin
-from src.trd import TRDTrajectoryMixin
+from src.trd import TRDTrajectoryMixin, configure_teacher_context
 
 
 _native_create_rl_dataset = main_ppo.create_rl_dataset
@@ -64,6 +64,7 @@ class BaselineTaskRunner(main_ppo.TaskRunner):
 
 @hydra.main(config_path="../third_party/verl/verl/trainer/config", config_name="ppo_trainer", version_base=None)
 def main(config):
+    configure_teacher_context(config)
     auto_set_device(config)
     config = migrate_legacy_reward_impl(config)
     main_ppo.run_ppo(config, task_runner_class=ray.remote(num_cpus=1)(BaselineTaskRunner))

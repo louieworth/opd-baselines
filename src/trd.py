@@ -41,6 +41,43 @@ def build_overrides(cfg: dict[str, Any]) -> list[str]:
     ]
 
 
+def configure_teacher_context(config) -> int | None:
+    """Reconcile the final Hydra overrides before constructing any teacher engine."""
+    if not config.get("trd", {}).get("enabled", False):
+        return None
+    prompt_length = positive_int(config.data, "max_prompt_length")
+    response_length = positive_int(config.actor_rollout_ref.rollout, "response_length")
+    refine_length = positive_int(config.trd, "max_prompt_length")
+    required = max(refine_length + response_length, prompt_length + response_length + 1)
+    inference = config.distillation.teacher_model.inference
+    requested = inference.get("max_model_len")
+    capacity = max(required, positive_int(inference, "max_model_len") if requested is not None else 0)
+    # Native distillation subsequently converts x + y_r into a scoring prompt
+    # with one output token. Keep that separate from the rewrite's y_r budget.
+    inference.prompt_length = prompt_length
+    inference.response_length = response_length
+    inference.max_model_len = capacity
+    inference.max_num_batched_tokens = max(
+        capacity, positive_int(inference, "max_num_batched_tokens", capacity),
+    )
+    if requested != capacity:
+        print(f"TRD teacher max_model_len: {requested} -> {capacity} "
+              f"(rewrite prompt limit={refine_length}, output budget={response_length})")
+    return required
+
+
+def check_teacher_context(prompt_length: int, response_length: int, capacity: int, *, stage: str) -> None:
+    required = prompt_length + response_length
+    if capacity < required:
+        raise ValueError(
+            "TRD teacher context must fit the complete rewrite prompt and y_r output budget: "
+            f"{stage}, prompt_tokens={prompt_length}, output_budget={response_length}, "
+            f"required_context={required}, teacher_max_model_len={capacity}. "
+            "The teacher engine must be initialized with at least required_context tokens; "
+            "check the final runtime configuration and restart with the updated src.runtime entrypoint."
+        )
+
+
 def replace_responses(batch, responses: list[list[int]], pad_token_id: int) -> None:
     """Replace y_o in-place before native teacher scoring and old-logprob scoring."""
     import torch
@@ -90,7 +127,14 @@ class TRDTrajectoryMixin:
         correction = self.config.algorithm.get("rollout_correction")
         if correction and correction.get("bypass_mode", False):
             raise ValueError("TRD requires FSDP old_log_probs recomputation; rollout bypass is unsupported")
+        configure_teacher_context(self.config)
         super().init_workers()
+        capacity = self.teacher_model_manager.config.teacher_model.inference.max_model_len
+        prompt_limit = self.config.trd.max_prompt_length
+        output_budget = self.config.actor_rollout_ref.rollout.response_length
+        check_teacher_context(prompt_limit, output_budget, capacity, stage="teacher initialization")
+        print(f"TRD teacher context verified: rewrite_prompt_limit={prompt_limit}, "
+              f"output_budget={output_budget}, teacher_max_model_len={capacity}")
 
     def _generate_refinements(self, batch) -> list[list[int]]:
         teacher = self.teacher_model_manager
@@ -99,7 +143,12 @@ class TRDTrajectoryMixin:
             self._trd_shared_vocabulary = self.tokenizer.get_vocab() == teacher_tokenizer.get_vocab()
         mode = self.config.data.prompt_mode
         limit = self.config.trd.max_prompt_length
-        response_length = batch.batch["responses"].shape[-1]
+        # The tensor's padded storage width is not the configured generation budget.
+        response_length = positive_int(self.config.actor_rollout_ref.rollout, "response_length")
+        response_width = batch.batch["responses"].shape[-1]
+        if response_width < response_length:
+            raise ValueError(f"TRD response storage width={response_width} is smaller than "
+                             f"the configured rewrite output budget={response_length}")
         prompt_width = batch.batch["prompts"].shape[-1]
         prompts = []
         for i, messages in enumerate(batch.non_tensor_batch["raw_prompt"]):
@@ -107,8 +156,10 @@ class TRDTrajectoryMixin:
             initial_ids = batch.batch["responses"][i][valid].tolist()
             initial_response = self.tokenizer.decode(initial_ids, skip_special_tokens=True)
             ids = refine_token_ids(teacher_tokenizer, messages, initial_response, mode, limit)
-            if len(ids) + response_length > teacher.config.teacher_model.inference.max_model_len:
-                raise ValueError("TRD teacher context must fit the complete rewrite prompt and y_r output budget")
+            check_teacher_context(
+                len(ids), response_length, teacher.config.teacher_model.inference.max_model_len,
+                stage=f"rewrite sample {i}",
+            )
             prompts.append(ids)
 
         rollout = self.config.actor_rollout_ref.rollout

@@ -28,7 +28,7 @@ kl_loss_coef: 0.0
 max_train_samples: 100000
 max_prompt_length: 2048
 max_completion_length: 16384
-actor_max_token_len_per_gpu: 40960
+actor_max_token_len_per_gpu: 18432
 
 temperature: 1.0
 top_p: 1.0
@@ -45,7 +45,7 @@ teacher_tp_size: 4
 teacher_gpu_memory_utilization: 0.3
 distillation_num_workers: 8
 distillation_loss_mode: reverse_kl_topk
-distillation_topk: 64
+distillation_topk: null
 distillation_use_policy_gradient: false
 distillation_use_task_rewards: false
 distillation_loss_coef: 1.0

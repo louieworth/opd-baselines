@@ -25,5 +25,7 @@ __pycache__/
 /tmp/
 /tests/*
 !/tests/test_code_science.py
+!/tests/test_trd.py
+!/tests/test_eopd_memory.py
 *.log
 .DS_Store

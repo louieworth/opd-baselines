@@ -46,7 +46,7 @@ teacher_gpu_memory_utilization: 0.3
 distillation_num_workers: 8
 distillation_loss_mode: k1
 # null: vanilla sampled k1; positive integer: conditional top-k reverse KL + PPO.
-distillation_topk: 64
+distillation_topk: null
 distillation_use_policy_gradient: true
 distillation_use_task_rewards: false
 distillation_loss_coef: 1.0

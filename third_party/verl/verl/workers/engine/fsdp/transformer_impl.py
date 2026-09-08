@@ -1159,7 +1159,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 metrics = {}
 
             output = {
-                "model_output": model_output,
+                # Only loss owns the backward graph. Returned predictions are
+                # accumulated across microbatches for reporting. In top-k
+                # distillation, unused sampled log-probs otherwise retain the
+                # full vocabulary logits through a separate autograd branch.
+                "model_output": {key: value.detach() for key, value in model_output.items()},
                 "loss": loss.detach().item(),
                 "metrics": metrics,
             }

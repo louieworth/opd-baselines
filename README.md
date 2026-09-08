@@ -190,6 +190,15 @@ W&B records the top-k OPD metrics plus `actor/eopd/aux_reverse_kl`,
 `actor/eopd/teacher_topk_entropy`, and `actor/eopd/high_entropy_fraction`.
 The auxiliary loss metric is reported before multiplying by its coefficient.
 
+The EOPD recipe uses an actor microbatch budget of 18432 tokens per GPU. Its
+main and auxiliary losses share one top-k selection, whose backward saves
+indices instead of retaining the full vocabulary logits. The FSDP engine
+detaches returned predictions after constructing the loss so unused probability
+graphs do not retain logits across microbatches. These changes preserve the
+objective, top-16 support, and 16384-token response budget. The LM head still
+produces full-vocabulary logits and one dense gradient, so peak GPU memory must
+be checked on the training hardware.
+
 ## OPSD reverse KL with pointwise clipping
 
 ```bash
@@ -244,8 +253,11 @@ on the target platform.
 
 ## TRD trajectories with the OPD loss
 
-`configs/qwen3_4b_trd.yaml` shares the OPD training, sampling, and evaluation
-settings, while retaining top-k `64` rather than OPD's `null`. Its experiment
+`configs/qwen3_4b_trd.yaml` shares the OPD sampling and evaluation settings,
+while retaining top-k `64` rather than OPD's `null`. Its actor micro-batch token
+budget remains 40,960 per GPU; the other packaged recipes use 18,432 to reduce
+training memory peaks while keeping their full response length and global batch
+size. Its experiment
 name is `qwen3_4b_trd`, with outputs under
 `outputs/qwen3_4b/trd/`. On the same eight GPUs, each training step runs:
 
@@ -269,8 +281,12 @@ Evaluation still samples and grades the student directly, without refinement.
 `refine_max_prompt_length: 19456` reserves 2,048 tokens for the question,
 16,384 for `y_o`, and 1,024 for rewrite instructions and tokenization overhead.
 The generated `y_r` retains the OPD `max_completion_length: 16384` limit.
-The teacher engine's total context is therefore 35,840 tokens; the student
-context and training batch settings stay the same. Rewrite prompts that exceed
+The teacher engine's total context is therefore 35,840 tokens. The runtime
+recomputes this requirement after Hydra overrides and increases the teacher
+context if needed before creating the engine. It checks the initialized teacher
+capacity before initial validation. The rewrite output budget comes from the
+configured rollout response length, independently of padded tensor width or
+the teacher scoring service's one-token output default. Rewrite prompts that exceed
 their budget raise an error instead of silently cutting the question or `y_o`.
 Increase `refine_max_prompt_length` if needed; it controls teacher input space,
 not the answer length. Teacher generation uses the selected prompt `mode` and

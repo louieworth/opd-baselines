@@ -28,7 +28,7 @@ kl_loss_coef: 0.0
 max_train_samples: 100000
 max_prompt_length: 2048
 max_completion_length: 16384
-actor_max_token_len_per_gpu: 40960
+actor_max_token_len_per_gpu: 18432
 
 temperature: 1.0
 top_p: 1.0
