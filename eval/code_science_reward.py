@@ -5,7 +5,10 @@ from __future__ import annotations
 import ast
 from functools import lru_cache
 import json
+import multiprocessing
+import os
 import re
+import sys
 
 from eval.baseline_reward import extract_last_boxed
 
@@ -78,14 +81,22 @@ def check_execution_runtime():
     """A broken execution environment must fail the run, not score every answer zero."""
     from evalplus.eval import PASS, untrusted_check
 
-    status, _ = untrusted_check(
+    status, details = untrusted_check(
         "mbpp", "def evalplus_runtime_probe(x):\n    return x", [[1]], "evalplus_runtime_probe",
         expected=[1], atol=0, ref_time=[0.001], fast_check=True,
     )
     if status != PASS:
+        import psutil
+        from evalplus.eval import query_maximum_memory_bytes
+
         raise RuntimeError(
-            "EvalPlus failed its known-correct execution probe. Check subprocess permissions and "
-            "resource limits; run benchmark evaluation in the supported Linux environment."
+            "EvalPlus failed its known-correct execution probe "
+            f"(status={status!r}, details={list(details)!r}, platform={sys.platform}, "
+            f"start_method={multiprocessing.get_start_method()}, pid={os.getpid()}, "
+            f"worker_vms_bytes={psutil.Process().memory_info().vms}, "
+            f"max_memory_bytes={query_maximum_memory_bytes()}). "
+            "Check child-process stderr, startup time, subprocess permissions, and resource limits. "
+            "Run python -m eval.reward_async --check in the Linux training environment."
         )
 
 

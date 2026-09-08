@@ -220,6 +220,8 @@ def preflight(cfg: dict[str, Any]) -> None:
     model = str(cfg["model_path"])
     if model.startswith(("./", "../", "/", "~")) and not local_path(model).is_dir():
         raise FileNotFoundError(f"model_path does not exist: {local_path(model)}")
+    if any(Path(path).stem == "mbppplus" for path in data_references(cfg["val_files"])):
+        subprocess.run([sys.executable, "-m", "eval.reward_async", "--check"], cwd=ROOT, check=True)
     try:
         __import__("flash_attn")
     except ImportError as exc:

@@ -429,6 +429,17 @@ if the error reports filtered questions. Packaged recipes use 4,096 tokens for
 validation prompts to retain the longest GPQA question, while training prompt
 filtering remains at 2,048. The shared rollout engine reserves the larger context.
 
+MBPP+ rewards run in a persistent standalone Python worker, so EvalPlus's child
+processes do not reload the Ray/training entrypoint or inherit model memory.
+The worker uses one BLAS/OpenMP thread and retains EvalPlus's time/memory limits.
+Recipes that validate on MBPP+ check this same reward path before training starts,
+including a correct solution and a solution that fails the plus tests. To run
+the check separately in the Linux training container:
+
+```bash
+python -m eval.reward_async --check
+```
+
 To evaluate without training or loading an OPD teacher:
 
 ```bash

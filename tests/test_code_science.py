@@ -3,8 +3,11 @@
 import asyncio
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
+import textwrap
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -135,6 +138,83 @@ def test_async_grader_can_spawn_evalplus_execution(identity_task):
     assert asyncio.run(score_async("gpqa_diamond", r"\boxed{B}", "B"))["acc"] == 1
 
 
+def test_mbpp_worker_does_not_reimport_slow_training_entrypoint(tmp_path, identity_task):
+    pytest.importorskip("evalplus")
+    script = tmp_path / "slow_training_entrypoint.py"
+    marker = tmp_path / "entrypoint_reimported"
+    script.write_text(textwrap.dedent(f"""\
+        import asyncio
+        import json
+        from pathlib import Path
+        import sys
+        import time
+
+        sys.path.insert(0, {str(ROOT)!r})
+        if __name__ == '__mp_main__':
+            Path({str(marker)!r}).touch()
+            time.sleep(4)  # Longer than EvalPlus's three-second probe budget.
+
+        from eval.reward_async import compute_score
+        from eval import mbpp_worker
+
+        async def run():
+            truth = {json.dumps(identity_task)!r}
+            codes = ['def identity(x):\\n    return x',
+                     'def identity(x):\\n    return abs(x)',
+                     'def identity(x):\\n    while True: pass']
+            results = await asyncio.gather(*(compute_score('mbppplus', code, truth) for code in codes))
+            assert [result['acc'] for result in results] == [1, 0, 0], results
+            pid = mbpp_worker._process.pid
+            try:
+                await compute_score('mbppplus', codes[0], '{{}}')
+            except RuntimeError as exc:
+                assert 'entry_point' in str(exc)
+            else:
+                raise AssertionError('worker errors must propagate')
+            assert (await compute_score('mbppplus', codes[0], truth))['acc'] == 1
+            assert mbpp_worker._process.pid == pid  # Reuse the worker and oracle cache.
+            mbpp_worker._process.terminate()
+            mbpp_worker._process.wait(timeout=5)
+            try:
+                await compute_score('mbppplus', codes[0], truth)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('worker exit must fail, not become a zero reward')
+
+        if __name__ == '__main__':
+            asyncio.run(run())
+    """))
+    result = subprocess.run([sys.executable, str(script)], cwd=ROOT, env=os.environ.copy(),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Exception ignored in atexit callback" not in result.stderr
+    assert not marker.exists(), "EvalPlus must not import the training entrypoint"
+
+
+def test_mbpp_reward_preflight_cli():
+    pytest.importorskip("evalplus")
+    result = subprocess.run([sys.executable, "-m", "eval.reward_async", "--check"], cwd=ROOT,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "EvalPlus reward self-check passed" in result.stdout
+
+
+def test_mbpp_preflight_failure_stops_before_training_imports(monkeypatch):
+    import builtins
+    import train
+
+    command = [sys.executable, "-m", "eval.reward_async", "--check"]
+    run = Mock(side_effect=subprocess.CalledProcessError(1, command))
+    monkeypatch.setattr(train.subprocess, "run", run)
+    imports = Mock(side_effect=AssertionError("must stop before importing training dependencies"))
+    monkeypatch.setattr(builtins, "__import__", imports)
+    with pytest.raises(subprocess.CalledProcessError):
+        train.preflight({"model_path": "Qwen/Qwen3-4B", "val_files": ["data/eval/mbppplus.parquet"]})
+    run.assert_called_once_with(command, cwd=ROOT, check=True)
+    imports.assert_not_called()
+
+
 def test_checkpoint_cli_restores_step_without_teacher(capsys):
     config = str(ROOT / "configs/qwen3_4b_opd.yaml")
     assert main([config, "--eval-only", "--checkpoint", "outputs/test/global_step_25", "--dry-run",
@@ -207,7 +287,7 @@ def test_execution_environment_failure_is_not_reported_as_model_failure(monkeypa
     import evalplus.eval
     from eval.code_science_reward import check_execution_runtime
     monkeypatch.setattr(evalplus.eval, "untrusted_check", lambda *args, **kwargs: ("timeout", []))
-    with pytest.raises(RuntimeError, match="known-correct execution probe"):
+    with pytest.raises(RuntimeError, match="known-correct execution probe.*status='timeout'.*start_method="):
         check_execution_runtime.__wrapped__()
 
 
