@@ -11,40 +11,31 @@ import torch
 
 from data.prompt_modes import ANSWER_INSTRUCTION
 from data.refine import refine_prompt, refine_token_ids
-from src.trd import TRDTrajectoryMixin, configure_teacher_context, replace_responses
+from src.trd import REFINE_KEYS, TRDTrajectoryMixin, check_teacher_context, configure_teacher_context, replace_responses
 from train import build_command, load_config, main
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_trd_changes_only_trajectory_stage_and_teacher_context():
-    configs = [load_config(ROOT / f"configs/qwen3_4b_{method}.yaml") for method in ("opd", "trd")]
-    for cfg in configs:
-        cfg.pop("wandb_api_key", None)
-    allowed = {"method", "experiment_name", "output_dir", "refine_max_prompt_length", "distillation_topk",
-               "actor_max_token_len_per_gpu"}
-    for key in set(configs[0]) | set(configs[1]):
-        if key not in allowed:
-            assert configs[0].get(key) == configs[1].get(key), key
-
-    assert configs[0]["distillation_topk"] is None
-    assert configs[1]["distillation_topk"] == 64
-    assert configs[0]["actor_max_token_len_per_gpu"] == 18432
-    assert configs[1]["actor_max_token_len_per_gpu"] == 40960
-    # Compare algorithm handoff with the same loss setting; packaged recipes
-    # intentionally differ now that vanilla OPD has top-k disabled.
-    configs[0]["distillation_topk"] = configs[1]["distillation_topk"]
-    configs[0]["actor_max_token_len_per_gpu"] = configs[1]["actor_max_token_len_per_gpu"]
+@pytest.mark.parametrize("topk", [None, 64])
+def test_trd_changes_only_trajectory_stage_and_teacher_context(topk):
+    recipe = load_config(ROOT / "configs/qwen3_4b_trd.yaml")
+    recipe.pop("wandb_api_key", None)
+    recipe["distillation_topk"] = topk
+    # Hold sampling and resource settings fixed when comparing the algorithms;
+    # packaged recipes can tune those independently.
+    original_recipe = {key: value for key, value in recipe.items() if key not in REFINE_KEYS}
+    original_recipe.update(method="opd", experiment_name="qwen3_4b_opd")
     effective = []
-    for cfg in configs:
+    for cfg in (original_recipe, recipe):
         command = build_command(cfg, Path("outputs/TEST"), [])
         with initialize_config_dir(config_dir=str(ROOT / "third_party/verl/verl/trainer/config"), version_base=None):
             effective.append(OmegaConf.to_container(compose(config_name="ppo_trainer", overrides=command[3:]), resolve=True))
     original, refined = effective
-    assert refined.pop("trd") == {"enabled": True, "max_prompt_length": 19456}
+    assert refined.pop("trd") == {"enabled": True, "max_prompt_length": 12288, "max_new_tokens": 8192}
     inference = refined["distillation"]["teacher_model"]["inference"]
-    assert inference["max_model_len"] == 35840
+    assert inference["max_model_len"] == inference["max_num_batched_tokens"] == 20480
     for key in ("max_model_len", "max_num_batched_tokens"):
         inference[key] = original["distillation"]["teacher_model"]["inference"][key]
     assert refined["trainer"]["experiment_name"] == "qwen3_4b_trd"
@@ -52,7 +43,7 @@ def test_trd_changes_only_trajectory_stage_and_teacher_context():
     refined["actor_rollout_ref"]["rollout"]["trace"]["experiment_name"] = original["actor_rollout_ref"]["rollout"]["trace"]["experiment_name"]
     assert refined == original
     loss = refined["distillation"]["distillation_loss"]
-    assert loss["loss_mode"] == "reverse_kl_topk"
+    assert loss["loss_mode"] == ("k1" if topk is None else "reverse_kl_topk")
     assert loss["use_policy_gradient"] is True
     assert loss["loss_max_clamp"] == 10
     assert loss["clip_ratio_low"] == loss["clip_ratio_high"] == 0.2
@@ -103,6 +94,70 @@ def test_refine_budget_is_measured_after_rendering_and_never_truncates(mode):
     assert refine_token_ids(tokenizer, messages, "whole initial answer", mode, len(ids)) == ids
     with pytest.raises(ValueError, match="increase that limit"):
         refine_token_ids(tokenizer, messages, "whole initial answer", mode, len(ids) - 1)
+
+
+def test_explicit_budget_accepts_reported_20745_token_rewrite_without_truncation():
+    recipe = load_config(ROOT / "configs/qwen3_4b_trd.yaml")
+    # Reproduce the larger input budget used for the former 16k student rollout.
+    recipe["refine_max_prompt_length"] = 24576
+    tokenizer = Tokenizer()
+    messages = [{"role": "user", "content": "Question"}]
+    mode = recipe["mode"]
+    overhead = len(refine_token_ids(tokenizer, messages, "", mode, 24576))
+    initial_response = "x" * (20745 - overhead)
+    with pytest.raises(ValueError, match="20745 tokens.*19456"):
+        refine_token_ids(tokenizer, messages, initial_response, mode, 19456)
+    ids = refine_token_ids(tokenizer, messages, initial_response, mode, recipe["refine_max_prompt_length"])
+    assert len(ids) == 20745
+    assert tokenizer.decode(ids, skip_special_tokens=False) == "thinking:" + refine_prompt(messages, initial_response)
+
+    command = build_command(recipe, Path("outputs/TEST"), [])
+    with initialize_config_dir(config_dir=str(ROOT / "third_party/verl/verl/trainer/config"), version_base=None):
+        config = compose(config_name="ppo_trainer", overrides=command[3:])
+    assert configure_teacher_context(config) == 32768
+    check_teacher_context(
+        len(ids), config.trd.max_new_tokens, config.distillation.teacher_model.inference.max_model_len,
+        stage="reported overflow",
+    )
+
+
+@pytest.mark.parametrize("response_length,student_context,refine_input,teacher_context", [
+    (4096, 8192, 8192, 12288),
+    (8192, 12288, 12288, 20480),
+    (16384, 20480, 20480, 36864),
+])
+def test_recipe_completion_budget_updates_validation_refinement_and_contexts(
+    response_length, student_context, refine_input, teacher_context,
+):
+    recipe = load_config(ROOT / "configs/qwen3_4b_trd.yaml")
+    assert recipe["max_completion_length"] == 8192
+    assert recipe["refine_prompt_token_reserve"] == 2048
+    assert not {"val_max_completion_length", "refine_max_new_tokens", "refine_max_prompt_length"} & recipe.keys()
+    recipe["max_completion_length"] = response_length
+    command = build_command(recipe, Path("outputs/TEST"), [])
+    with initialize_config_dir(config_dir=str(ROOT / "third_party/verl/verl/trainer/config"), version_base=None):
+        config = compose(config_name="ppo_trainer", overrides=command[3:])
+    rollout = config.actor_rollout_ref.rollout
+    assert config.data.max_response_length == rollout.response_length == response_length
+    assert rollout.prompt_length == 4096
+    assert rollout.max_model_len == rollout.max_num_batched_tokens == student_context
+    assert rollout.log_prob_max_token_len_per_gpu == student_context
+    assert config.actor_rollout_ref.ref.log_prob_max_token_len_per_gpu == student_context
+    assert config.trd.max_prompt_length == refine_input
+    assert config.trd.max_new_tokens == response_length
+    assert configure_teacher_context(config) == teacher_context
+    inference = config.distillation.teacher_model.inference
+    assert inference.max_model_len == inference.max_num_batched_tokens == teacher_context
+    assert inference.prompt_length == 2048
+    assert inference.response_length == response_length
+
+
+@pytest.mark.parametrize("reserve", [0, -1, True, "invalid"])
+def test_invalid_refinement_reserve_is_rejected(reserve):
+    recipe = load_config(ROOT / "configs/qwen3_4b_trd.yaml")
+    recipe["refine_prompt_token_reserve"] = reserve
+    with pytest.raises(ValueError, match="refine_prompt_token_reserve"):
+        build_command(recipe, Path("outputs/TEST"), [])
 
 
 class Batch:
@@ -269,6 +324,19 @@ def test_shared_vocabulary_keeps_exact_sampled_tokens(monkeypatch):
     assert trainer._generate_refinements(Batch()) == [list(map(ord, "newA\x02")), list(map(ord, "newB\x02"))]
 
 
+def test_refinement_uses_its_own_output_budget(monkeypatch):
+    trainer = Trainer()
+    trainer.config.trd.max_new_tokens = 3
+
+    async def generate(*, request_id, prompt_ids, sampling_params):
+        assert sampling_params["max_tokens"] == 3
+        return SimpleNamespace(token_ids=[70, 2], stop_reason="completed")
+
+    monkeypatch.setattr(trainer.teacher_model_manager, "generate", generate)
+    assert trainer._generate_refinements(Batch()) == [[70, 2], [70, 2]]
+    assert trainer.events[-2:] == ["teacher_wake", "teacher_sleep"]
+
+
 def test_native_dataproto_handoff():
     protocol = pytest.importorskip("verl.protocol")
     from tensordict import TensorDict
@@ -316,23 +384,30 @@ def test_trd_rejects_rollout_bypass_before_initializing_gpus():
     assert "init_workers" not in trainer.events
 
 
-@pytest.mark.parametrize("requested,output_budget,expected", [
-    (18433, 16384, 35840),
-    (35840, 16384, 35840),
-    (65536, 16384, 65536),
-    (None, 16384, 35840),
-    (35840, 32768, 52224),
+@pytest.mark.parametrize("requested,output_budget,refine_budget,required,expected", [
+    (18433, 16384, 8192, 32768, 32768),
+    (32768, 16384, 8192, 32768, 32768),
+    (65536, 16384, 8192, 32768, 65536),
+    (None, 16384, 8192, 32768, 32768),
+    (32768, 32768, 8192, 34817, 34817),  # Scoring is the larger context requirement.
+    (32768, 16384, 16384, 40960, 40960),
+    (None, 16384, None, 40960, 40960),  # Omitted rewrite budget uses the student budget.
 ])
-def test_final_hydra_overrides_reserve_full_rewrite_budget(requested, output_budget, expected):
+def test_final_hydra_overrides_reserve_full_rewrite_budget(requested, output_budget, refine_budget, required, expected):
     recipe = load_config(ROOT / "configs/qwen3_4b_trd.yaml")
+    recipe["refine_max_prompt_length"] = 24576
     extras = [
         f"distillation.teacher_model.inference.max_model_len={requested if requested is not None else 'null'}",
         f"actor_rollout_ref.rollout.response_length={output_budget}",
     ]
+    if refine_budget is None:
+        recipe.pop("refine_max_new_tokens", None)
+    else:
+        extras.append(f"trd.max_new_tokens={refine_budget}")
     command = build_command(recipe, Path("outputs/TEST"), extras)
     with initialize_config_dir(config_dir=str(ROOT / "third_party/verl/verl/trainer/config"), version_base=None):
         config = compose(config_name="ppo_trainer", overrides=command[3:])
-    assert configure_teacher_context(config) == 19456 + output_budget
+    assert configure_teacher_context(config) == required
     inference = config.distillation.teacher_model.inference
     assert inference.max_model_len == expected
     assert inference.max_num_batched_tokens >= expected

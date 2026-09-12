@@ -27,7 +27,7 @@ kl_loss_coef: 0.0
 
 max_train_samples: 100000
 max_prompt_length: 2048
-max_completion_length: 16384
+max_completion_length: 8192
 actor_max_token_len_per_gpu: 40960
 
 temperature: 1.0
@@ -80,7 +80,7 @@ val_files:
 val_before_train: true
 eval_steps: 25
 val_max_prompt_length: 4096
-val_max_completion_length: 16384
+# Omit val_max_completion_length so validation follows max_completion_length (8192).
 val_do_sample: true
 val_n: 8
 val_temperature: 0.7
@@ -90,15 +90,10 @@ val_batch_size: 16
 
 save_steps: 25
 
-# Teacher rewrite input: x (2048) + y_o (16384) + instruction/tokenization reserve (1024).
-# y_r keeps max_completion_length=16384. Teacher total context becomes 35840.
-refine_max_prompt_length: 24576
-# Raised from 19456: under mode=thinking the rewrite prompt goes through the teacher's
-# chat template and y_o is longer, and a sample at step 21 needed 20745 tokens, which
-# aborted the run. 24576 leaves headroom over the worst case (question + y_o + template).
-# Teacher context stays at refine_max_prompt_length + refine_max_new_tokens = 32768,
-# i.e. still BELOW the previous 35840, so decode concurrency does not regress.
+# Derive rewrite input from max_prompt_length + max_completion_length + reserve:
+# 2048 + 8192 + 2048 = 12288. This is a budget, not a guaranteed tokenizer bound.
+# Set refine_max_prompt_length explicitly only to override this calculation.
+refine_prompt_token_reserve: 2048
 
-# Cap y_r at 8192 (rewrites average ~3.9k tokens, so 2x headroom). Requesting the
-# full 16384 made vLLM reserve KV for the worst case and halved decode concurrency.
-refine_max_new_tokens: 8192
+# Omit refine_max_new_tokens so y_r follows max_completion_length (8192).
+# Teacher context is max(12288 + 8192, 2048 + 8192 + 1) = 20480.

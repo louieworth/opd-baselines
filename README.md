@@ -54,7 +54,7 @@ platform prepare its own models. Models and caches are excluded from the bundle.
 OPD uses reverse KL in policy-gradient mode, with no task-reward term. Its
 `distillation_topk` switch chooses vanilla sampled `k1` (`null`, also the default
 when omitted) or a conditional top-k `k1`/PPO expectation (a positive integer).
-The packaged OPD config sets `null`; TRD retains `64`. EOPD sets `16` and adds
+The packaged OPD and TRD configs set `null`. EOPD sets `16` and adds
 an entropy-gated reverse KL auxiliary term. OPSD uses pointwise-clipped reverse
 KL with top-k `64`. All distillation recipes use reverse KL; GRPO uses verifier
 reward.
@@ -253,8 +253,8 @@ on the target platform.
 
 ## TRD trajectories with the OPD loss
 
-`configs/qwen3_4b_trd.yaml` shares the OPD sampling and evaluation settings,
-while retaining top-k `64` rather than OPD's `null`. Its actor micro-batch token
+`configs/qwen3_4b_trd.yaml` uses the OPD sampled `k1` loss with top-k disabled
+(`null`) and `mode: thinking` for teacher chat templating. Its actor micro-batch token
 budget remains 40,960 per GPU; the other packaged recipes use 18,432 to reduce
 training memory peaks while keeping their full response length and global batch
 size. Its experiment
@@ -272,24 +272,39 @@ name is `qwen3_4b_trd`, with outputs under
    to the student rollout engine.
 
 The loss is the same selected `k1` policy-gradient loss as OPD, controlled by
-`distillation_topk` (`64` in TRD, `null` in OPD for vanilla k1).
+`distillation_topk` (`null` in both packaged recipes for vanilla k1).
 It includes the `[-10, 10]` distillation-signal clamp, PPO ratio clipping at
 `[0.8, 1.2]`, and dual clipping. Training rewards and masks are
 recomputed for `y_r`; cached probabilities from generating `y_o` are discarded.
 Evaluation still samples and grades the student directly, without refinement.
 
-`refine_max_prompt_length: 19456` reserves 2,048 tokens for the question,
-16,384 for `y_o`, and 1,024 for rewrite instructions and tokenization overhead.
-The generated `y_r` retains the OPD `max_completion_length: 16384` limit.
-The teacher engine's total context is therefore 35,840 tokens. The runtime
+`max_completion_length: 8192` caps student `y_o` generation. The recipe omits
+`val_max_completion_length` and `refine_max_new_tokens`, so validation responses
+and teacher `y_r` generation inherit this budget. The student engine's context
+is 12,288 tokens (4,096 validation prompt tokens + 8,192 response tokens), while
+training questions remain limited to 2,048 tokens.
+
+The rewrite input limit is calculated from `max_prompt_length` plus
+`max_completion_length` plus `refine_prompt_token_reserve: 2048`, giving
+12,288 tokens (2,048 + 8,192 + 2,048). An explicit `refine_max_prompt_length`
+overrides that calculation. The reserve defaults to 1,024 if omitted; it is
+an allowance for instructions, chat templating, and retokenization, not a
+guaranteed bound on teacher input length. The teacher engine's total context
+is 20,480 tokens, the larger of rewrite input plus output (12,288 + 8,192) and
+native scoring (2,048 + 8,192 + 1). The runtime
 recomputes this requirement after Hydra overrides and increases the teacher
 context if needed before creating the engine. It checks the initialized teacher
 capacity before initial validation. The rewrite output budget comes from the
-configured rollout response length, independently of padded tensor width or
-the teacher scoring service's one-token output default. Rewrite prompts that exceed
-their budget raise an error instead of silently cutting the question or `y_o`.
-Increase `refine_max_prompt_length` if needed; it controls teacher input space,
-not the answer length. Teacher generation uses the selected prompt `mode` and
+configured `refine_max_new_tokens` (or the rollout response length if omitted),
+independently of padded tensor width or the teacher scoring service's one-token
+output default. Rewrite prompts that exceed their budget raise an error instead
+of silently cutting the question or `y_o`.
+Increase `refine_max_prompt_length` and restart if a future input exceeds the
+limit; it controls teacher input space, not the answer length. For example,
+`trd.max_prompt_length=24576` explicitly reserves a larger input budget and
+raises teacher context to 32,768 with an 8,192-token output budget.
+Use `--dry-run` to check effective values when a remote job reports an old
+limit. Teacher generation uses the selected prompt `mode` and
 the same temperature, top-p, and top-k as student training rollout.
 
 ```bash

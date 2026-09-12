@@ -11,7 +11,7 @@ from src import opd
 from src.config import override, positive_int, strict_bool
 
 
-REFINE_KEYS = {"refine_max_prompt_length", "refine_max_new_tokens"}
+REFINE_KEYS = {"refine_max_prompt_length", "refine_max_new_tokens", "refine_prompt_token_reserve"}
 CONFIG_KEYS = opd.CONFIG_KEYS | REFINE_KEYS
 ENVIRONMENT_OVERRIDES = opd.ENVIRONMENT_OVERRIDES
 
@@ -20,8 +20,9 @@ def validate_config(cfg: dict[str, Any]) -> None:
     opd.validate_config(cfg)
     if strict_bool(cfg, "teacher_enable_resource_pool", False):
         raise ValueError("TRD requires the teacher to share the student GPU resource pool")
-    if "refine_max_prompt_length" in cfg:
-        positive_int(cfg, "refine_max_prompt_length")
+    for key in ("refine_max_prompt_length", "refine_prompt_token_reserve"):
+        if key in cfg:
+            positive_int(cfg, key)
     if "refine_max_new_tokens" in cfg:
         budget = positive_int(cfg, "refine_max_new_tokens")
         if budget > positive_int(cfg, "max_completion_length", 8192):
@@ -32,7 +33,8 @@ def build_overrides(cfg: dict[str, Any]) -> list[str]:
     validate_config(cfg)
     prompt_length = positive_int(cfg, "max_prompt_length", 2048)
     response_length = positive_int(cfg, "max_completion_length", 8192)
-    refine_length = positive_int(cfg, "refine_max_prompt_length", prompt_length + response_length + 1024)
+    reserve = positive_int(cfg, "refine_prompt_token_reserve", 1024)
+    refine_length = positive_int(cfg, "refine_max_prompt_length", prompt_length + response_length + reserve)
     refine_budget = positive_int(cfg, "refine_max_new_tokens", response_length)
     # Refinement consumes x + y_o + instructions, followed by y_r (refine_budget,
     # NOT the full response_length). Scoring still consumes the original student
@@ -47,7 +49,8 @@ def build_overrides(cfg: dict[str, Any]) -> list[str]:
         # Cap on y_r. Defaults to the full response budget (previous behaviour);
         # a smaller value stops vLLM from reserving KV space for the worst case,
         # which is what limits teacher decode concurrency.
-        override("+trd.max_new_tokens", positive_int(cfg, "refine_max_new_tokens", response_length)),
+        # Resolve the default after any final Hydra override to the student budget.
+        override("+trd.max_new_tokens", cfg.get("refine_max_new_tokens", "${actor_rollout_ref.rollout.response_length}")),
     ]
 
 
