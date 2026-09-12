@@ -29,3 +29,11 @@ __pycache__/
 !/tests/test_eopd_memory.py
 *.log
 .DS_Store
+
+# Greenland deployment tooling: contains internal AWS account ids, IAM/KMS ARNs
+# and internal endpoints, and this repository is public.
+/greenland/
+/jobs/
+/.dockerignore
+# Local notes: holds a W&B API key and an SSH host.
+/CLAUDE.md

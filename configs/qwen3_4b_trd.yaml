@@ -33,16 +33,32 @@ actor_max_token_len_per_gpu: 40960
 temperature: 1.0
 top_p: 1.0
 top_k_sampling: -1
-mode: plaint  # thinking | non-thinking | plaint; shared by train and eval
+mode: thinking  # thinking | non-thinking | plaint; shared by train and eval
+# thinking (not plaint) so the TRD rewrite prompt goes through the teacher's chat
+# template. data/refine.py only calls apply_chat_template for thinking/non-thinking;
+# under plaint the Instruct teacher got raw text, never emitted a reliable stop, and
+# 41-46% of rewrites hit the 16384 max_tokens cap (mean 10031 vs student's 1250),
+# which made each step take ~6h and fed truncated trajectories back as targets.
 
-vllm_gpu_memory_utilization: 0.6
+vllm_gpu_memory_utilization: 0.25
+# Reallocated toward the teacher, which is the bottleneck: teacher decode is
+# 92% of step time (4808s) while student rollout is 4% (195s). Student+teacher
+# still sum to 0.75, so the FSDP2 training budget is unchanged (no new OOM risk).
+# 0.45 student + 0.30 teacher leaves ~20 GB per 80 GB GPU for FSDP2
+# params/grads/Adam/activations. Upstream's OOM fix lowered
+# actor_max_token_len_per_gpu to 18432, which halves the activation spike,
+# but at 0.6 the two vLLM engines still reserve ~71 GB and eopd/opsd OOMed
+# in actor_rollout_update_actor (10 GiB alloc with <1 GiB free).
 
 # Native verl external-teacher distillation.
 teacher_model_path: Qwen/Qwen3-30B-A3B-Instruct-2507
 teacher_enable_resource_pool: false
 teacher_n_gpus_per_node: 8
 teacher_tp_size: 4
-teacher_gpu_memory_utilization: 0.3
+teacher_gpu_memory_utilization: 0.5
+# KV cache goes 7.2 -> 24.8 GB/GPU (0.5*80 - 61/tp4 - overhead), lifting teacher
+# decode concurrency from ~24 to ~80. tp cannot help here: Qwen3-30B-A3B has only
+# num_key_value_heads=4, so teacher_tp_size>4 would duplicate KV heads instead.
 distillation_num_workers: 8
 distillation_loss_mode: k1
 # null: vanilla sampled k1; positive integer: conditional top-k reverse KL + PPO.
@@ -76,4 +92,13 @@ save_steps: 25
 
 # Teacher rewrite input: x (2048) + y_o (16384) + instruction/tokenization reserve (1024).
 # y_r keeps max_completion_length=16384. Teacher total context becomes 35840.
-refine_max_prompt_length: 19456
+refine_max_prompt_length: 24576
+# Raised from 19456: under mode=thinking the rewrite prompt goes through the teacher's
+# chat template and y_o is longer, and a sample at step 21 needed 20745 tokens, which
+# aborted the run. 24576 leaves headroom over the worst case (question + y_o + template).
+# Teacher context stays at refine_max_prompt_length + refine_max_new_tokens = 32768,
+# i.e. still BELOW the previous 35840, so decode concurrency does not regress.
+
+# Cap y_r at 8192 (rewrites average ~3.9k tokens, so 2x headroom). Requesting the
+# full 16384 made vLLM reserve KV for the worst case and halved decode concurrency.
+refine_max_new_tokens: 8192

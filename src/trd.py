@@ -11,7 +11,7 @@ from src import opd
 from src.config import override, positive_int, strict_bool
 
 
-REFINE_KEYS = {"refine_max_prompt_length"}
+REFINE_KEYS = {"refine_max_prompt_length", "refine_max_new_tokens"}
 CONFIG_KEYS = opd.CONFIG_KEYS | REFINE_KEYS
 ENVIRONMENT_OVERRIDES = opd.ENVIRONMENT_OVERRIDES
 
@@ -22,6 +22,10 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise ValueError("TRD requires the teacher to share the student GPU resource pool")
     if "refine_max_prompt_length" in cfg:
         positive_int(cfg, "refine_max_prompt_length")
+    if "refine_max_new_tokens" in cfg:
+        budget = positive_int(cfg, "refine_max_new_tokens")
+        if budget > positive_int(cfg, "max_completion_length", 8192):
+            raise ValueError("refine_max_new_tokens cannot exceed max_completion_length")
 
 
 def build_overrides(cfg: dict[str, Any]) -> list[str]:
@@ -29,15 +33,21 @@ def build_overrides(cfg: dict[str, Any]) -> list[str]:
     prompt_length = positive_int(cfg, "max_prompt_length", 2048)
     response_length = positive_int(cfg, "max_completion_length", 8192)
     refine_length = positive_int(cfg, "refine_max_prompt_length", prompt_length + response_length + 1024)
-    # Refinement consumes x + y_o + instructions, followed by a full y_r.
-    # Scoring still consumes only the original student prompt + y_r + one token.
-    context_length = max(refine_length + response_length, prompt_length + response_length + 1)
+    refine_budget = positive_int(cfg, "refine_max_new_tokens", response_length)
+    # Refinement consumes x + y_o + instructions, followed by y_r (refine_budget,
+    # NOT the full response_length). Scoring still consumes the original student
+    # prompt + y_r + one token, so both bounds are kept.
+    context_length = max(refine_length + refine_budget, prompt_length + response_length + 1)
     overrides = dict(item.split("=", 1) for item in opd.build_overrides(cfg))
     overrides["distillation.teacher_model.inference.max_model_len"] = str(context_length)
     overrides["distillation.teacher_model.inference.max_num_batched_tokens"] = str(context_length)
     return [f"{key}={value}" for key, value in overrides.items()] + [
         override("+trd.enabled", True),
         override("+trd.max_prompt_length", refine_length),
+        # Cap on y_r. Defaults to the full response budget (previous behaviour);
+        # a smaller value stops vLLM from reserving KV space for the worst case,
+        # which is what limits teacher decode concurrency.
+        override("+trd.max_new_tokens", positive_int(cfg, "refine_max_new_tokens", response_length)),
     ]
 
 
@@ -48,7 +58,8 @@ def configure_teacher_context(config) -> int | None:
     prompt_length = positive_int(config.data, "max_prompt_length")
     response_length = positive_int(config.actor_rollout_ref.rollout, "response_length")
     refine_length = positive_int(config.trd, "max_prompt_length")
-    required = max(refine_length + response_length, prompt_length + response_length + 1)
+    refine_budget = positive_int(config.trd, "max_new_tokens", response_length)
+    required = max(refine_length + refine_budget, prompt_length + response_length + 1)
     inference = config.distillation.teacher_model.inference
     requested = inference.get("max_model_len")
     capacity = max(required, positive_int(inference, "max_model_len") if requested is not None else 0)
@@ -62,7 +73,7 @@ def configure_teacher_context(config) -> int | None:
     )
     if requested != capacity:
         print(f"TRD teacher max_model_len: {requested} -> {capacity} "
-              f"(rewrite prompt limit={refine_length}, output budget={response_length})")
+              f"(rewrite prompt limit={refine_length}, output budget={refine_budget})")
     return required
 
 
@@ -131,7 +142,8 @@ class TRDTrajectoryMixin:
         super().init_workers()
         capacity = self.teacher_model_manager.config.teacher_model.inference.max_model_len
         prompt_limit = self.config.trd.max_prompt_length
-        output_budget = self.config.actor_rollout_ref.rollout.response_length
+        output_budget = positive_int(self.config.trd, "max_new_tokens",
+                                    self.config.actor_rollout_ref.rollout.response_length)
         check_teacher_context(prompt_limit, output_budget, capacity, stage="teacher initialization")
         print(f"TRD teacher context verified: rewrite_prompt_limit={prompt_limit}, "
               f"output_budget={output_budget}, teacher_max_model_len={capacity}")
@@ -150,6 +162,7 @@ class TRDTrajectoryMixin:
             raise ValueError(f"TRD response storage width={response_width} is smaller than "
                              f"the configured rewrite output budget={response_length}")
         prompt_width = batch.batch["prompts"].shape[-1]
+        refine_budget = positive_int(self.config.trd, "max_new_tokens", response_length)
         prompts = []
         for i, messages in enumerate(batch.non_tensor_batch["raw_prompt"]):
             valid = batch.batch["attention_mask"][i, prompt_width:].bool()
@@ -157,16 +170,20 @@ class TRDTrajectoryMixin:
             initial_response = self.tokenizer.decode(initial_ids, skip_special_tokens=True)
             ids = refine_token_ids(teacher_tokenizer, messages, initial_response, mode, limit)
             check_teacher_context(
-                len(ids), response_length, teacher.config.teacher_model.inference.max_model_len,
+                len(ids), refine_budget, teacher.config.teacher_model.inference.max_model_len,
                 stage=f"rewrite sample {i}",
             )
             prompts.append(ids)
 
         rollout = self.config.actor_rollout_ref.rollout
+        # Requesting the full response_length makes vLLM reserve KV cache for the
+        # worst case, so teacher decode concurrency collapses (~24 with a 7.2 GB
+        # cache) even though rewrites average ~3.9k tokens. trd.max_new_tokens
+        # defaults to response_length, preserving the original behaviour.
         sampling_params = {
             # Explicit max_tokens is essential: native distillation defaults to
             # generating only ONE token when requesting prompt log-probabilities.
-            "max_tokens": response_length,
+            "max_tokens": refine_budget,
             "temperature": rollout.temperature,
             "top_p": rollout.top_p,
             "top_k": rollout.top_k,

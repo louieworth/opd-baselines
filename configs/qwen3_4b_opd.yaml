@@ -35,7 +35,12 @@ top_p: 1.0
 top_k_sampling: -1
 mode: plaint  # thinking | non-thinking | plaint; shared by train and eval
 
-vllm_gpu_memory_utilization: 0.6
+vllm_gpu_memory_utilization: 0.45
+# 0.45 student + 0.30 teacher leaves ~20 GB per 80 GB GPU for FSDP2
+# params/grads/Adam/activations. Upstream's OOM fix lowered
+# actor_max_token_len_per_gpu to 18432, which halves the activation spike,
+# but at 0.6 the two vLLM engines still reserve ~71 GB and eopd/opsd OOMed
+# in actor_rollout_update_actor (10 GiB alloc with <1 GiB free).
 
 # Native verl external-teacher distillation.
 teacher_model_path: Qwen/Qwen3-30B-A3B-Instruct-2507

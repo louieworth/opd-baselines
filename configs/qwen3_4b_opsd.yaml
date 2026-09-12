@@ -35,7 +35,12 @@ top_p: 1.0
 top_k_sampling: -1
 mode: plaint  # thinking | non-thinking | plaint; shared by train and eval
 
-vllm_gpu_memory_utilization: 0.6
+vllm_gpu_memory_utilization: 0.45
+# 0.45 student + 0.30 teacher leaves ~20 GB per 80 GB GPU for FSDP2
+# params/grads/Adam/activations. Upstream's OOM fix lowered
+# actor_max_token_len_per_gpu to 18432, which halves the activation spike,
+# but at 0.6 the two vLLM engines still reserve ~71 GB and eopd/opsd OOMed
+# in actor_rollout_update_actor (10 GiB alloc with <1 GiB free).
 
 # External-teacher reverse KL with pointwise clipping on teacher top-k.
 teacher_model_path: Qwen/Qwen3-30B-A3B-Instruct-2507
@@ -45,7 +50,12 @@ teacher_tp_size: 4
 teacher_gpu_memory_utilization: 0.3
 distillation_num_workers: 8
 distillation_loss_mode: reverse_kl_topk
-distillation_topk: null
+distillation_topk: 64
+# Must stay a positive integer: distillation_loss_mode=reverse_kl_topk requires it,
+# and src/opd.py rejects the recipe outright otherwise. The 'fix oom' commit set this
+# to null (valid for trd, which uses loss_mode=k1), which made every opsd job die in
+# load_config before training. The OOM fix that matters here is
+# actor_max_token_len_per_gpu=18432, which is retained.
 distillation_use_policy_gradient: false
 distillation_use_task_rewards: false
 distillation_loss_coef: 1.0
