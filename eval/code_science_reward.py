@@ -109,13 +109,13 @@ def score_mbpp(solution: str, ground_truth: str) -> dict[str, float]:
     try:
         with time_limit(10):
             code = extract_code(solution, entrypoint)
-    except TimeoutException:
+    except (TimeoutException, RecursionError):
         return {"score": 0.0, "acc": 0.0, "formatted": 0.0}
     try:
         tree = ast.parse(code)
         formatted = any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == entrypoint
                         for node in tree.body)
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, RecursionError):
         formatted = False
     if not formatted:
         return {"score": 0.0, "acc": 0.0, "formatted": 0.0}

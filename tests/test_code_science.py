@@ -161,9 +161,12 @@ def test_mbpp_worker_does_not_reimport_slow_training_entrypoint(tmp_path, identi
             truth = {json.dumps(identity_task)!r}
             codes = ['def identity(x):\\n    return x',
                      'def identity(x):\\n    return abs(x)',
-                     'def identity(x):\\n    while True: pass']
+                     'def identity(x):\\n    while True: pass',
+                     'def identity(x):\\n    return ' + ' + '.join(['x'] * 1500),
+                     'def identity(x):\\n    return x']
             results = await asyncio.gather(*(compute_score('mbppplus', code, truth) for code in codes))
-            assert [result['acc'] for result in results] == [1, 0, 0], results
+            assert [result['acc'] for result in results] == [1, 0, 0, 0, 1], results
+            assert results[3] == {{'score': 0.0, 'acc': 0.0, 'formatted': 0.0}}, results[3]
             pid = mbpp_worker._process.pid
             try:
                 await compute_score('mbppplus', codes[0], '{{}}')
@@ -300,6 +303,32 @@ def test_sanitizer_timeout_is_bounded(monkeypatch, identity_task):
     monkeypatch.setattr(grading, "check_execution_runtime", lambda: None)
     monkeypatch.setattr(grading, "extract_code", timeout)
     assert grading.score_mbpp("malformed output", json.dumps(identity_task))["acc"] == 0
+
+
+@pytest.mark.parametrize("stage", ["sanitize", "parse"])
+def test_mbpp_recursion_failure_scores_zero_silently(monkeypatch, identity_task, stage, capsys, caplog):
+    pytest.importorskip("evalplus")
+    import eval.code_science_reward as grading
+    import evalplus.sanitize as sanitizer
+
+    monkeypatch.setattr(grading, "check_execution_runtime", lambda: None)
+    oracle = Mock(side_effect=AssertionError("unprocessable code must not reach execution"))
+    monkeypatch.setattr(grading, "mbpp_oracle", oracle)
+    failure = Mock(side_effect=RecursionError("synthetic deep syntax tree"))
+    with monkeypatch.context() as patch:
+        if stage == "sanitize":
+            patch.setattr(sanitizer, "sanitize", failure)
+        else:
+            patch.setattr(grading, "extract_code", lambda *args: identity_task["canonical_solution"])
+            patch.setattr(grading.ast, "parse", failure)
+        result = grading.score_mbpp(identity_task["canonical_solution"], json.dumps(identity_task))
+
+    assert result == {"score": 0.0, "acc": 0.0, "formatted": 0.0}
+    failure.assert_called_once()
+    oracle.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+    assert not caplog.records
 
 
 @pytest.fixture
