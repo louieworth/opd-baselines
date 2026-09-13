@@ -6,7 +6,7 @@ import asyncio
 from typing import Any
 from uuid import uuid4
 
-from data.refine import refine_token_ids
+from data.refine import refine_token_ids_batch
 from src import opd
 from src.config import override, positive_int, strict_bool
 
@@ -166,17 +166,14 @@ class TRDTrajectoryMixin:
                              f"the configured rewrite output budget={response_length}")
         prompt_width = batch.batch["prompts"].shape[-1]
         refine_budget = positive_int(self.config.trd, "max_new_tokens", response_length)
-        prompts = []
-        for i, messages in enumerate(batch.non_tensor_batch["raw_prompt"]):
-            valid = batch.batch["attention_mask"][i, prompt_width:].bool()
-            initial_ids = batch.batch["responses"][i][valid].tolist()
-            initial_response = self.tokenizer.decode(initial_ids, skip_special_tokens=True)
-            ids = refine_token_ids(teacher_tokenizer, messages, initial_response, mode, limit)
-            check_teacher_context(
-                len(ids), refine_budget, teacher.config.teacher_model.inference.max_model_len,
-                stage=f"rewrite sample {i}",
-            )
-            prompts.append(ids)
+        initial_ids = batch.batch["responses"].masked_fill(
+            ~batch.batch["attention_mask"][:, prompt_width:].bool(), self.tokenizer.pad_token_id,
+        )
+        initial_responses = self.tokenizer.batch_decode(initial_ids.tolist(), skip_special_tokens=True)
+        prompts = refine_token_ids_batch(
+            teacher_tokenizer, batch.non_tensor_batch["raw_prompt"], initial_responses, mode, limit,
+            device=initial_ids.device,
+        )
 
         rollout = self.config.actor_rollout_ref.rollout
         # Requesting the full response_length makes vLLM reserve KV cache for the

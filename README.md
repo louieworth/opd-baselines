@@ -297,10 +297,15 @@ context if needed before creating the engine. It checks the initialized teacher
 capacity before initial validation. The rewrite output budget comes from the
 configured `refine_max_new_tokens` (or the rollout response length if omitted),
 independently of padded tensor width or the teacher scoring service's one-token
-output default. Rewrite prompts that exceed their budget raise an error instead
-of silently cutting the question or `y_o`.
-Increase `refine_max_prompt_length` and restart if a future input exceeds the
-limit; it controls teacher input space, not the answer length. For example,
+output default. Before each teacher generation stage, the whole batch is
+tokenized and clipped to the rewrite input limit using batched tensor operations.
+Clipping removes the end of `y_o` while retaining the question, rewrite
+instructions, and assistant generation prefix. If the question alone exhausts
+the space available before the instructions, its tail is clipped too.
+Tokenization runs on the CPU; tensor operations use the rollout batch's device
+(CPU in the current Ray trainer). There are no per-sample length checks or
+clipping logs. `refine_max_prompt_length` controls teacher input space, not the
+answer length. For example,
 `trd.max_prompt_length=24576` explicitly reserves a larger input budget and
 raises teacher context to 32,768 with an 8,192-token output budget.
 Use `--dry-run` to check effective values when a remote job reports an old

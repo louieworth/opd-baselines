@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from data.prompt_modes import ANSWER_INSTRUCTION
-from data.refine import refine_prompt, refine_token_ids
+from data.refine import refine_prompt, refine_token_ids, refine_token_ids_batch
 from src.trd import REFINE_KEYS, TRDTrajectoryMixin, check_teacher_context, configure_teacher_context, replace_responses
 from train import build_command, load_config, main
 
@@ -59,6 +59,8 @@ def test_trd_eval_only_removes_refinement(capsys):
 
 class Tokenizer:
     pad_token_id = 0
+    padding_side = "left"
+    truncation_side = "left"
 
     def get_vocab(self):
         return {chr(i): i for i in range(256)}
@@ -69,12 +71,26 @@ class Tokenizer:
 
     def decode(self, ids, *, skip_special_tokens):
         text = "".join(map(chr, ids))
-        return text.replace("\x02", "") if skip_special_tokens else text
+        return text.replace("\x02", "").replace("\x00", "") if skip_special_tokens else text
+
+    def batch_decode(self, sequences, *, skip_special_tokens):
+        return [self.decode(ids, skip_special_tokens=skip_special_tokens) for ids in sequences]
+
+    def __call__(self, texts, *, add_special_tokens, padding, truncation, max_length, return_tensors):
+        assert not add_special_tokens and padding and truncation and return_tensors == "pt"
+        assert self.padding_side == self.truncation_side == "right"
+        rows = [list(map(ord, text))[:max_length] for text in texts]
+        width = max(map(len, rows))
+        return {
+            "input_ids": torch.tensor([row + [0] * (width - len(row)) for row in rows]),
+            "attention_mask": torch.tensor([[1] * len(row) + [0] * (width - len(row)) for row in rows]),
+        }
 
     def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, enable_thinking):
-        assert tokenize and add_generation_prompt
+        assert add_generation_prompt
         prefix = "thinking:" if enable_thinking else "non-thinking:"
-        return self.encode(prefix + messages[0]["content"], add_special_tokens=False)
+        rendered = [prefix + conversation[0]["content"] for conversation in messages]
+        return [self.encode(text, add_special_tokens=False) for text in rendered] if tokenize else rendered
 
 
 def test_refine_prompt_preserves_question_and_initial_answer():
@@ -87,38 +103,67 @@ def test_refine_prompt_preserves_question_and_initial_answer():
 
 
 @pytest.mark.parametrize("mode", ["plaint", "thinking", "non-thinking"])
-def test_refine_budget_is_measured_after_rendering_and_never_truncates(mode):
+def test_refine_budget_clips_answer_after_rendering_and_keeps_instructions(mode):
     tokenizer = Tokenizer()
     messages = [{"role": "user", "content": "Question"}]
     ids = refine_token_ids(tokenizer, messages, "whole initial answer", mode, 1000)
     assert refine_token_ids(tokenizer, messages, "whole initial answer", mode, len(ids)) == ids
-    with pytest.raises(ValueError, match="increase that limit"):
-        refine_token_ids(tokenizer, messages, "whole initial answer", mode, len(ids) - 1)
+    clipped = refine_token_ids(tokenizer, messages, "whole initial answer", mode, len(ids) - 1)
+    assert len(clipped) == len(ids) - 1
+    assert tokenizer.decode(clipped, skip_special_tokens=False) == tokenizer.decode(
+        ids, skip_special_tokens=False,
+    ).replace("whole initial answer", "whole initial answe")
+    assert tokenizer.padding_side == tokenizer.truncation_side == "left"
 
 
-def test_explicit_budget_accepts_reported_20745_token_rewrite_without_truncation():
+@pytest.mark.parametrize("original_length", [20745, 23793])
+def test_packaged_budget_clips_reported_overflows(original_length):
     recipe = load_config(ROOT / "configs/qwen3_4b_trd.yaml")
-    # Reproduce the larger input budget used for the former 16k student rollout.
-    recipe["refine_max_prompt_length"] = 24576
     tokenizer = Tokenizer()
     messages = [{"role": "user", "content": "Question"}]
     mode = recipe["mode"]
-    overhead = len(refine_token_ids(tokenizer, messages, "", mode, 24576))
-    initial_response = "x" * (20745 - overhead)
-    with pytest.raises(ValueError, match="20745 tokens.*19456"):
-        refine_token_ids(tokenizer, messages, initial_response, mode, 19456)
-    ids = refine_token_ids(tokenizer, messages, initial_response, mode, recipe["refine_max_prompt_length"])
-    assert len(ids) == 20745
-    assert tokenizer.decode(ids, skip_special_tokens=False) == "thinking:" + refine_prompt(messages, initial_response)
-
     command = build_command(recipe, Path("outputs/TEST"), [])
     with initialize_config_dir(config_dir=str(ROOT / "third_party/verl/verl/trainer/config"), version_base=None):
         config = compose(config_name="ppo_trainer", overrides=command[3:])
-    assert configure_teacher_context(config) == 32768
+    assert configure_teacher_context(config) == 20480
+    limit = config.trd.max_prompt_length
+    overhead = len(refine_token_ids(tokenizer, messages, "", mode, limit))
+    initial_response = "x" * (original_length - overhead)
+    assert len(refine_token_ids(tokenizer, messages, initial_response, mode, original_length)) == original_length
+    ids = refine_token_ids(tokenizer, messages, initial_response, mode, limit)
+    assert len(ids) == limit == 12288
+    assert tokenizer.decode(ids, skip_special_tokens=False) == "thinking:" + refine_prompt(
+        messages, initial_response[:limit - overhead],
+    )
     check_teacher_context(
         len(ids), config.trd.max_new_tokens, config.distillation.teacher_model.inference.max_model_len,
         stage="reported overflow",
     )
+
+
+@pytest.mark.parametrize("mode", ["plaint", "thinking", "non-thinking"])
+def test_batch_clipping_handles_short_exact_and_overlong_prompts(mode):
+    tokenizer = Tokenizer()
+    messages = [{"role": "user", "content": "question"}]
+    limit = 600
+    overhead = len(refine_token_ids(tokenizer, messages, "", mode, limit))
+    answers = ["", "short", "x" * (limit - overhead), "x" * 23793]
+    result = refine_token_ids_batch(tokenizer, [messages] * len(answers), answers, mode, limit)
+    assert list(map(len, result)) == [overhead, overhead + 5, limit, limit]
+    for ids, answer in zip(result, answers):
+        text = tokenizer.decode(ids, skip_special_tokens=False)
+        assert text.endswith(refine_prompt(messages, answer[:limit - overhead]))
+
+
+def test_batch_clipping_reserves_instructions_when_question_exceeds_budget():
+    tokenizer = Tokenizer()
+    messages = [{"role": "user", "content": "question" + "x" * 23793}]
+    ids = refine_token_ids_batch(tokenizer, [messages], ["answer"], "thinking", 600)[0]
+    assert len(ids) == 600
+    text = tokenizer.decode(ids, skip_special_tokens=False)
+    assert text.startswith("thinking:Your task is to rewrite")
+    assert "**Instructions:**" in text
+    assert text.endswith(ANSWER_INSTRUCTION)
 
 
 @pytest.mark.parametrize("response_length,student_context,refine_input,teacher_context", [
@@ -368,12 +413,29 @@ def test_native_dataproto_handoff():
     assert "old_log_probs" not in batch.batch
 
 
-def test_teacher_generation_reserves_output_space_before_waking():
+@pytest.mark.parametrize("mode", ["plaint", "thinking", "non-thinking"])
+def test_teacher_generation_tokenizes_and_clips_the_whole_batch(monkeypatch, mode):
     trainer = Trainer()
-    trainer.teacher_model_manager.config.teacher_model.inference.max_model_len = 100
-    with pytest.raises(ValueError, match="context must fit"):
-        trainer._generate_refinements(Batch())
-    assert "teacher_wake" not in trainer.events
+    trainer.config.data.prompt_mode = mode
+    trainer.config.trd.max_prompt_length = 600
+    tokenization_batches = []
+    original_tokenize = Tokenizer.__call__
+
+    def tokenize(self, texts, **kwargs):
+        assert trainer.events[-1] != "teacher_wake"
+        tokenization_batches.append(len(texts))
+        return original_tokenize(self, texts, **kwargs)
+
+    monkeypatch.setattr(Tokenizer, "__call__", tokenize)
+    monkeypatch.setattr(trainer.tokenizer, "batch_decode", lambda *args, **kwargs: ["x" * 23793, "bad"])
+    for _ in range(2):
+        assert trainer._compute_teacher_colocate(Batch()) == "native_teacher_scores"
+        long_prompt, short_prompt = [prompt for prompt, _ in trainer.teacher_model_manager.requests[-2:]]
+        assert len(long_prompt) == 600
+        assert len(short_prompt) < 600
+        assert "question A" in long_prompt and "**Instructions:**" in long_prompt
+        assert "**Your Initial Solution:**\nbad" in short_prompt
+    assert tokenization_batches == [6, 6]  # One batch call for all three segments of both samples.
 
 
 def test_trd_rejects_rollout_bypass_before_initializing_gpus():

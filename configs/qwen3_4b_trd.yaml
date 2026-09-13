@@ -92,6 +92,7 @@ save_steps: 25
 
 # Derive rewrite input from max_prompt_length + max_completion_length + reserve:
 # 2048 + 8192 + 2048 = 12288. This is a budget, not a guaranteed tokenizer bound.
+# Batch tokenization clips excess y_o tokens while keeping the rewrite instructions.
 # Set refine_max_prompt_length explicitly only to override this calculation.
 refine_prompt_token_reserve: 2048
 
