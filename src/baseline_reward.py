@@ -1,7 +1,8 @@
-"""Rule-based boxed-answer reward for math rollouts."""
+"""Rule-based boxed-answer reward for math and multiple-choice rollouts."""
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -60,6 +61,16 @@ def answers_match(predicted: str, ground_truth: str) -> bool:
         return normalize(predicted) == normalize(ground_truth)
 
 
+def choice_letter(predicted: str) -> str | None:
+    """Normalize one boxed A--D label without guessing from reasoning text."""
+    label = predicted.strip().strip("$").strip()
+    wrapper = re.fullmatch(r"\\(?:text|mathrm|mathbf)\{\s*([A-Da-d])\s*\}", label)
+    if wrapper:
+        label = wrapper.group(1)
+    label = label.strip("() ").upper()
+    return label if label in {"A", "B", "C", "D"} else None
+
+
 def compute_score(
     data_source: str,
     solution_str: str,
@@ -76,6 +87,15 @@ def compute_score(
         return {"score": score, "acc": score, "formatted": float(extract_last_boxed(solution_str) is not None)}
     predicted = extract_last_boxed(solution_str)
     formatted = float(predicted is not None)
+    if data_source in {"mmlu", "mmlu_college_chemistry", "mmlu_college_medicine", "gpqa_diamond"}:
+        selected = choice_letter(predicted) if predicted is not None else None
+        score = float(selected is not None and selected == str(ground_truth).strip().upper())
+        return {"score": score, "acc": score, "formatted": formatted}
+    if data_source == "math500":
+        # Currency answers contain escaped dollar signs and LaTeX thin spaces.
+        ground_truth = str(ground_truth).replace(r"\$", "").replace(r"\!", "")
+        if predicted is not None:
+            predicted = predicted.replace(r"\$", "").replace(r"\!", "")
     correct = predicted is not None and answers_match(predicted, str(ground_truth))
     score = float(correct)
     return {"score": score, "acc": score, "formatted": formatted}

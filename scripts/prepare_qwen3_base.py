@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare Qwen3-4B-Base for ChatML rollout stop/pad semantics."""
+"""Prepare Qwen3 Base students for ChatML rollout stop/pad semantics."""
 
 from __future__ import annotations
 
@@ -16,6 +16,10 @@ from transformers import AutoTokenizer
 
 SOURCE = "Qwen/Qwen3-4B-Base"
 REVISION = "906bfd4b4dc7f14ee4320094d8b41684abff8539"
+MODEL_REVISIONS = {
+    SOURCE: REVISION,
+    "Qwen/Qwen3-1.7B-Base": "ea980cb0a6c2ae4b936e82123acc929f1cec04c1",
+}
 MANIFEST = "PREPARED.json"
 REWRITTEN = {"tokenizer_config.json", "generation_config.json", "config.json"}
 EOS_TOKEN = "<|im_end|>"
@@ -155,39 +159,44 @@ def prepare(snapshot: Path, target: Path, source: str, revision: str, force: boo
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default=SOURCE)
-    parser.add_argument("--revision", default=REVISION)
-    parser.add_argument("--target", type=Path, default=Path("models/Qwen3-4B-Base-chatml"))
+    parser.add_argument("--revision", help="defaults to the pinned revision for the selected source")
+    parser.add_argument("--target", type=Path, help="defaults to models/<source-name>-chatml")
     parser.add_argument("--cache-dir", type=Path)
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
+    revision = args.revision or MODEL_REVISIONS.get(args.source)
+    if revision is None:
+        parser.error("--revision is required for an unrecognized source model")
+    target = args.target or Path("models") / f"{args.source.rsplit('/', 1)[-1]}-chatml"
     snapshot = Path(
         snapshot_download(
             repo_id=args.source,
-            revision=args.revision,
+            revision=revision,
             cache_dir=str(args.cache_dir) if args.cache_dir else None,
             local_files_only=args.local_files_only,
         )
     )
-    prepare(snapshot, args.target, args.source, args.revision, args.force)
-    print(f"prepared {args.target}")
+    prepare(snapshot, target, args.source, revision, args.force)
+    print(f"prepared {target}")
     return 0
 
 
-def ensure_prepared(target: Path) -> None:
+def ensure_prepared(target: Path, *, source: str = SOURCE, local_files_only: bool = False) -> None:
     """Download once on the training platform, then reuse validated local weights."""
+    revision = MODEL_REVISIONS[source]
     marker = target / MANIFEST
     if marker.is_file():
         manifest = read_json(marker)
-        if manifest.get("source") != SOURCE or manifest.get("revision") != REVISION:
+        if manifest.get("source") != source or manifest.get("revision") != revision:
             raise ValueError(f"{target}: prepared model does not match the pinned source")
         validate_target(target, token_ids(target))
         print(f"Reusing prepared student: {target.name}")
         return
     if target.exists():
         raise FileExistsError(f"{target}: unrecognized model directory; set MODEL_PATH to use it explicitly")
-    snapshot = Path(snapshot_download(repo_id=SOURCE, revision=REVISION))
-    prepare(snapshot, target, SOURCE, REVISION, False)
+    snapshot = Path(snapshot_download(repo_id=source, revision=revision, local_files_only=local_files_only))
+    prepare(snapshot, target, source, revision, False)
 
 
 if __name__ == "__main__":

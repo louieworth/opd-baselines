@@ -3,7 +3,7 @@ model_path: Qwen/Qwen3-4B-Base
 auto_prepare_model: true
 
 project_name: opd
-experiment_name: qwen3_4b_grpo_mode_plaint
+experiment_name: qwen3_4b_base_grpo_mode_plaint
 output_dir: ./outputs/qwen3_4b/grpo/mode_plaint
 use_wandb: true
 # Optional API key; null uses WANDB_API_KEY or saved W&B login.
