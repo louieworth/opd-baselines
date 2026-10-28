@@ -3,25 +3,25 @@ model_path: Qwen/Qwen3-4B-Base
 auto_prepare_model: true
 local_models_only: true  # Use pre-downloaded HF snapshots; no network in SLURM.
 
-project_name: opd
+project_name: onestep-opd
 experiment_name: qwen3_4b_base_grpo
 output_dir: /scratch/l/luli/results/onestep
 use_wandb: true
 wandb_mode: offline
 # Sync offline runs to this entity after the SLURM job finishes.
-wandb_entity: li-jiang-opd
+wandb_entity: null
 
-# 8 GPUs x 4 prompts x 8 responses = 256 trajectories per update, matching OPD.
+# 8 GPUs x 2 prompts x 8 responses = 128 trajectories per update, matching OPD.
 # Keep eight responses per prompt for GRPO's group-relative advantage.
 # The two-node sbatch overrides the physical layout to 2 x 4 GPUs.
 n_gpus_per_node: 8
 vllm_tensor_parallel_size: 1
-per_device_batch_size: 4
+per_device_batch_size: 2
 group_size: 8
-ppo_mini_batch_size: 32  # Native verl multiplies this prompt count by group_size.
-# OPD's current one-epoch budget: 69 x 256 = 17,664 trajectories.
-# GRPO stops after 2,208 prompt visits; this is not a full GRPO prompt epoch.
-total_training_steps: 69
+ppo_mini_batch_size: 16  # Native verl multiplies this prompt count by group_size.
+# Aligned to OPD's one-epoch step count: floor(14484 English prompts / 128) = 113.
+# null would run 905 steps (full GRPO prompt epoch) — 8x more than OPD.
+total_training_steps: 113
 num_epochs: 1
 
 learning_rate: 1.0e-6
@@ -42,24 +42,22 @@ mode: plaint  # thinking | non-thinking | plaint; shared by train and eval
 
 vllm_gpu_memory_utilization: 0.6
 
-train_files: /scratch/l/luli/data/lightning_opd/train/dapo_math_17k.parquet
+train_files: /scratch/l/luli/data/lightning_opd/train/dapo_math_17k_en.parquet
 val_files:
   - /scratch/l/luli/data/lightning_opd/eval/amc23.parquet
-  - /scratch/l/luli/data/lightning_opd/eval/math500.parquet
+  - /scratch/l/luli/data/lightning_opd/eval/aime25.parquet
   - /scratch/l/luli/data/lightning_opd/eval/aime26.parquet
   - /scratch/l/luli/data/lightning_opd/eval/hmmt26.parquet
-  - /scratch/l/luli/data/lightning_opd/eval/mmlu_college_chemistry.parquet
-  - /scratch/l/luli/data/lightning_opd/eval/mmlu_college_medicine.parquet
   - /scratch/l/luli/data/lightning_opd/eval/gpqa_diamond.parquet
-val_before_train: true
-eval_steps: 15  # Also evaluate before training and after the final step.
+val_before_train: false  # Pass val_before_train=true on the CLI for a step-0 eval.
+eval_steps: 20  # Evals at steps 20, 40, 60, 80, 100 and after the final step.
 val_max_prompt_length: 4096
 val_max_completion_length: 16384
 val_do_sample: true
-val_n: 1
-val_temperature: 0.7
-val_top_p: 0.8
-val_top_k: 20
+val_n: 4
+val_temperature: 1.0
+val_top_p: 1.0
+val_top_k: -1
 val_batch_size: 16
 save_eval_generations: false
 

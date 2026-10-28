@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the packaged GRPO or plain OPD baseline through native verl."""
+"""Launch GRPO, OPD, or sampled-answer V2 ADOPD through native verl."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,10 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from src.opd_options import KEYS as OPD_EXTENSION_KEYS, needs_features, options as opd_options
+from src.opd_options import KEYS as OPD_EXTENSION_KEYS, needs_features, options as opd_options, selects_response_tokens
+from src.teacher_prompt import has_teacher_prompt
+from src.adopd_options import KEYS as ADOPD_KEYS, options as adopd_options
+from src.adopd_options import LOSS_KEYS as ADOPD_LOSS_KEYS, objective_name as adopd_objective_name
 
 if __package__:
     from .checkpoint_io import TRACKER_FILENAME, prune_checkpoints, resume_paths
@@ -29,7 +33,7 @@ else:
 
 
 ROOT = Path(__file__).resolve().parents[1]
-METHODS = {"grpo", "opd"}
+METHODS = {"grpo", "opd", "adopd"}
 PROMPT_MODES = {"thinking", "non-thinking", "plaint"}
 QWEN3_BASE_STUDENTS = {"Qwen/Qwen3-4B-Base", "Qwen/Qwen3-1.7B-Base"}
 BASE_CONFIG_RENAMES = {
@@ -54,10 +58,13 @@ ALLOWED_KEYS = {
     "wandb_entity",
     "wandb_api_key",
     "n_gpus_per_node",
+    "h100_nnodes",
+    "h100_runtime",
     "vllm_tensor_parallel_size",
     "per_device_batch_size",
     "group_size",
     "ppo_mini_batch_size",
+    "ppo_micro_batch_size_per_gpu",
     "total_training_steps",
     "num_epochs",
     "learning_rate",
@@ -69,6 +76,7 @@ ALLOWED_KEYS = {
     "max_prompt_length",
     "max_completion_length",
     "actor_max_token_len_per_gpu",
+    "actor_use_dynamic_bsz",
     "temperature",
     "top_p",
     "top_k_sampling",
@@ -121,6 +129,8 @@ OPD_ONLY_KEYS = {
 }
 ALLOWED_KEYS.update(OPD_EXTENSION_KEYS)
 OPD_ONLY_KEYS.update(OPD_EXTENSION_KEYS)
+ALLOWED_KEYS.update(ADOPD_KEYS)
+OPD_ONLY_KEYS.update(ADOPD_KEYS)
 
 
 def resolve_config_path(path: Path) -> Path:
@@ -156,6 +166,8 @@ def load_config(path: Path) -> dict[str, Any]:
     method = str(payload.get("method", "")).lower()
     if method not in METHODS:
         raise ValueError(f"{path}: method must be one of {sorted(METHODS)}, got {method!r}")
+    if method != 'adopd' and set(ADOPD_KEYS).intersection(payload):
+        raise ValueError('ADOPD options require method: adopd')
     if method == "grpo":
         stray = sorted(OPD_ONLY_KEYS.intersection(payload))
         if stray:
@@ -164,10 +176,45 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError(f"{path}: OPD requires teacher_model_path")
     if method == "opd":
         payload.update(opd_options(payload))
-        if needs_features(payload) and payload.get("distillation_loss_mode", "k1") != "k1":
-            raise ValueError("Vocabulary OPD extensions require native distillation_loss_mode: k1")
+        if has_teacher_prompt(payload) and payload.get("teacher_enable_resource_pool", False):
+            raise ValueError("Teacher-only prompts currently require colocated, batched teacher scoring")
+        if (needs_features(payload) or has_teacher_prompt(payload) or selects_response_tokens(payload)) and payload.get("distillation_loss_mode", "k1") != "k1":
+            raise ValueError("OPD vocabulary/teacher-prompt extensions require native distillation_loss_mode: k1")
+    if method == "adopd":
+        payload.update(adopd_options(payload))
+        if payload.get('distillation_loss_mode', 'k1') != 'k1':
+            raise ValueError('ADOPD uses distillation_loss_mode: k1 for native registration; select the answer loss with opd_loss_token_mode')
+        if payload.get('teacher_enable_resource_pool', False):
+            raise ValueError('ADOPD requires colocated, batched teacher scoring')
+        if payload.get('opd_enable_metrics', False):
+            raise ValueError('ADOPD vocabulary diagnostics are unsupported')
+        if payload.get('teacher_prompt') or selects_response_tokens(payload):
+            raise ValueError('ADOPD V2 uses cached reference traces and its own answer mask')
+        if payload.get('kl_loss_coef', 0) != 0 or payload.get('distillation_use_task_rewards', False):
+            raise ValueError('ADOPD recipe uses neither task rewards nor trace KL regularization')
     payload["mode"] = prompt_mode(payload)
+    positive_int(payload, "h100_nnodes", 1)
+    h100_inference_settings(payload)
     return payload
+
+
+def apply_opd_overrides(cfg: dict[str, Any], extra: list[str]) -> None:
+    """Apply OPD extension overrides before building the Ray worker environment."""
+    if cfg.get('method') == 'adopd':
+        for item in extra:
+            key, separator, raw = item.partition('=')
+            if separator and key.lstrip('+') in (*ADOPD_KEYS, *ADOPD_LOSS_KEYS):
+                cfg[key.lstrip('+')] = yaml.safe_load(raw)
+        cfg.update(adopd_options(cfg))
+        return
+    if cfg.get("method") != "opd":
+        return
+    for item in extra:
+        key, separator, raw = item.partition("=")
+        key = key.lstrip("+")
+        if separator and key in OPD_EXTENSION_KEYS:
+            cfg[key] = yaml.safe_load(raw)
+    cfg.update(opd_options(cfg))
 
 
 def prompt_mode(cfg: dict[str, Any]) -> str:
@@ -197,6 +244,64 @@ def strict_bool(cfg: dict[str, Any], key: str, default: bool) -> bool:
     return value
 
 
+def h100_inference_settings(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Validate optional per-engine H100 scheduling overrides."""
+    settings = cfg.get("h100_runtime", {})
+    if not isinstance(settings, dict):
+        raise ValueError("h100_runtime must be a mapping")
+    roles = {"student", "teacher"}
+    per_role = bool(roles.intersection(settings))
+    if per_role and set(settings) - roles:
+        raise ValueError("h100_runtime cannot mix role-specific and shared settings")
+    result = {}
+    supported = {"enforce_eager", "enable_chunked_prefill", "max_num_batched_tokens", "max_num_seqs"}
+    for role in sorted(roles):
+        values = settings.get(role, {}) if per_role else settings
+        if not isinstance(values, dict) or set(values) - supported:
+            raise ValueError(f"Unsupported h100_runtime settings for {role}: {values!r}")
+        for key, value in values.items():
+            if key in {"enforce_eager", "enable_chunked_prefill"}:
+                if type(value) is not bool:
+                    raise ValueError(f"h100_runtime.{role}.{key} must be a boolean")
+            elif type(value) is not int or value < 1:
+                raise ValueError(f"h100_runtime.{role}.{key} must be a positive integer")
+        result[role] = values
+    return result
+
+
+def validate_actor_batching(overrides: list[str]) -> None:
+    """Check effective batching settings, including trailing Hydra overrides."""
+    keys = {
+        "data.max_prompt_length", "data.max_response_length",
+        "actor_rollout_ref.actor.use_dynamic_bsz",
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu",
+        "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz",
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu",
+    }
+    settings = {}
+    for item in overrides:
+        key, _, value = item.partition("=")
+        key = key.lstrip("+")
+        if key in keys:
+            settings[key] = yaml.safe_load(value)
+    dynamic = strict_bool(settings, "actor_rollout_ref.actor.use_dynamic_bsz", True)
+    if dynamic != strict_bool(settings, "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz", True):
+        raise ValueError("Actor and rollout log-probability batching must use the same use_dynamic_bsz")
+    if dynamic:
+        budget_key = "actor_rollout_ref.actor.ppo_max_token_len_per_gpu"
+        budget = positive_int(settings, budget_key)
+        sequence_length = (positive_int(settings, "data.max_prompt_length")
+                           + positive_int(settings, "data.max_response_length"))
+        if budget < sequence_length:
+            raise ValueError(f"{budget_key}={budget} must cover the full training sequence "
+                             f"(max_prompt_length + max_response_length = {sequence_length}); "
+                             "use actor_use_dynamic_bsz: false for fixed-size microbatches")
+    else:
+        positive_int(settings, "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu")
+        positive_int(settings, "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu")
+
+
 def hydra_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -223,8 +328,19 @@ def run_directory_name(cfg: dict[str, Any], stamp: str) -> str:
 
     student = model_name(str(cfg["model_path"]))
     names = [student]
+    if cfg['method'] == 'adopd':
+        group = cfg['group_size'] if cfg['adopd_use_group_rollouts'] else 1
+        names.extend(['v2', cfg.get('opd_loss_token_mode', 'sample'), f"b{cfg['adopd_reasoning_budget']}", f'g{group}'])
     if cfg["method"] == "opd":
         names.append(model_name(str(cfg["teacher_model_path"])))
+        if has_teacher_prompt(cfg):
+            names.extend(["efficient_reasoning", cfg.get("opd_loss_token_mode", "sample")])
+        if cfg.get("opd_loss_last_n_tokens") is not None:
+            names.append(f"last{cfg['opd_loss_last_n_tokens']}")
+        if cfg.get("opd_loss_top_k_divergence") is not None:
+            names.append(f"divergence_top{cfg['opd_loss_top_k_divergence']}")
+        if cfg.get("opd_require_verified", False):
+            names.append("verified")
     names.extend([cfg["method"], stamp])
     return "-".join(names)
 
@@ -265,17 +381,31 @@ def effective_model(cfg: dict[str, Any]) -> str:
 
 def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[str]:
     method = str(cfg["method"]).lower()
+    adopd = method == 'adopd'
+    eval_only = cfg.get('_adopd_eval_only', False)
+    full_answer_kl = adopd and cfg.get('opd_loss_token_mode') == 'full_vocab'
     mode = prompt_mode(cfg)
     n_gpus = positive_int(cfg, "n_gpus_per_node", 8)
+    nnodes = positive_int(cfg, "h100_nnodes", 1)
     tp_size = positive_int(cfg, "vllm_tensor_parallel_size", 1)
     if n_gpus % tp_size:
         raise ValueError(f"n_gpus_per_node={n_gpus} is not divisible by tensor parallel size={tp_size}")
 
     per_device = positive_int(cfg, "per_device_batch_size")
     group_size = positive_int(cfg, "group_size")
-    rollout_batch = per_device * (n_gpus // tp_size)
+    rollout_batch = per_device * (n_gpus * nnodes // tp_size)
+    if adopd:
+        group_size = group_size if cfg['adopd_use_group_rollouts'] and not eval_only else 1
+        if rollout_batch % group_size:
+            raise ValueError('ADOPD trajectory batch must be divisible by the effective group size')
+        rollout_batch //= group_size
     rollout_samples = rollout_batch * group_size
-    mini_batch = positive_int(cfg, "ppo_mini_batch_size", rollout_batch)
+    mini_batch = (rollout_samples if adopd and cfg.get('ppo_mini_batch_size') is None
+                  else positive_int(cfg, "ppo_mini_batch_size", rollout_batch))
+    if adopd:
+        if mini_batch != rollout_samples:
+            raise ValueError('ADOPD ppo_mini_batch_size must equal the total trajectory batch')
+        mini_batch //= group_size  # native verl multiplies this prompt count by rollout.n
     if rollout_samples % mini_batch:
         raise ValueError(
             f"rollout samples ({rollout_samples}) must be divisible by ppo_mini_batch_size ({mini_batch})"
@@ -298,6 +428,8 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
     rollout_prompt_length = max(max_prompt, val_max_prompt)
     rollout_max_len = max(train_max_seq, val_max_prompt + val_max_response)
     actor_token_budget = positive_int(cfg, "actor_max_token_len_per_gpu", train_max_seq)
+    actor_dynamic_bsz = strict_bool(cfg, "actor_use_dynamic_bsz", True)
+    actor_micro_batch = positive_int(cfg, "ppo_micro_batch_size_per_gpu", 4)
 
     train_files = data_references(cfg["train_files"])
     val_files = data_references(cfg["val_files"])
@@ -330,11 +462,13 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
         override("trainer.use_legacy_worker_impl", "disable"),
         override("trainer.critic_warmup", 0),
         override("trainer.logger", logger),
-        override("trainer.project_name", cfg.get("project_name", "opd")),
-        override("trainer.experiment_name", cfg.get("experiment_name", method)),
+        override("trainer.project_name", cfg.get("project_name") or os.environ.get("WANDB_PROJECT")),
+        override("trainer.experiment_name", (re.sub(r'_(sample|full_vocab)$', '', cfg.get('experiment_name', method))
+            + f"_{cfg.get('opd_loss_token_mode', 'sample')}_g{group_size}" if adopd
+            else cfg.get('experiment_name', method))),
         override("trainer.default_local_dir", run_dir),
         override("trainer.n_gpus_per_node", n_gpus),
-        override("trainer.nnodes", 1),
+        override("trainer.nnodes", nnodes),
         override("trainer.save_freq", int(cfg.get("save_steps", 25))),
         override("trainer.test_freq", int(cfg.get("eval_steps", -1))),
         override("trainer.total_epochs", positive_int(cfg, "num_epochs", 1)),
@@ -363,18 +497,21 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
         override("actor_rollout_ref.actor.optim.lr_warmup_steps", int(cfg.get("warmup_steps", 0))),
         override("actor_rollout_ref.actor.grad_clip", float(cfg.get("max_grad_norm", 1.0))),
         override("actor_rollout_ref.actor.ppo_mini_batch_size", mini_batch),
-        override("actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu", 4),
-        override("actor_rollout_ref.actor.use_dynamic_bsz", True),
+        override("actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu", actor_micro_batch),
+        override("actor_rollout_ref.actor.use_dynamic_bsz", actor_dynamic_bsz),
         override("actor_rollout_ref.actor.ppo_max_token_len_per_gpu", actor_token_budget),
         override("actor_rollout_ref.actor.use_kl_loss", use_kl),
         override("actor_rollout_ref.actor.kl_loss_coef", kl_coef),
         override("actor_rollout_ref.actor.kl_loss_type", "low_var_kl"),
         override("actor_rollout_ref.actor.entropy_coeff", 0),
         override("actor_rollout_ref.actor.strategy", "fsdp2"),
-        override("actor_rollout_ref.actor.fsdp_config.model_dtype", "bf16"),
+        # Keep FP32 optimizer parameters; FSDP mixed precision casts the forward
+        # to BF16. Direct BF16 AdamW loses small updates at the recipe's 1e-6 LR.
+        override("actor_rollout_ref.actor.fsdp_config.model_dtype", "fp32"),
         override("actor_rollout_ref.actor.fsdp_config.param_offload", False),
         override("actor_rollout_ref.actor.fsdp_config.optimizer_offload", False),
         override("actor_rollout_ref.actor.policy_loss.loss_mode", "vanilla"),
+        override("actor_rollout_ref.actor.loss_agg_mode", "seq-mean-token-mean"),
         override("actor_rollout_ref.actor.checkpoint.save_contents", checkpoint_contents),
         override("actor_rollout_ref.actor.checkpoint.load_contents", [
             item for item in checkpoint_contents if item != "hf_model"
@@ -382,13 +519,14 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
         override("actor_rollout_ref.rollout.temperature", float(cfg.get("temperature", 1.0))),
         override("actor_rollout_ref.rollout.top_p", float(cfg.get("top_p", 1.0))),
         override("actor_rollout_ref.rollout.top_k", int(cfg.get("top_k_sampling", -1))),
-        override("actor_rollout_ref.rollout.log_prob_use_dynamic_bsz", True),
+        override("actor_rollout_ref.rollout.log_prob_use_dynamic_bsz", actor_dynamic_bsz),
+        override("actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu", actor_micro_batch),
         override("actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu", train_max_seq),
         override("actor_rollout_ref.rollout.tensor_model_parallel_size", tp_size),
         override("actor_rollout_ref.rollout.name", "vllm"),
         override("actor_rollout_ref.rollout.gpu_memory_utilization", float(cfg.get("vllm_gpu_memory_utilization", 0.6))),
         override("actor_rollout_ref.rollout.n", group_size),
-        override("actor_rollout_ref.rollout.agent.num_workers", n_gpus),
+        override("actor_rollout_ref.rollout.agent.num_workers", n_gpus * nnodes),
         override("actor_rollout_ref.rollout.load_format", "safetensors"),
         override("actor_rollout_ref.rollout.layered_summon", True),
         override("actor_rollout_ref.rollout.max_model_len", rollout_max_len),
@@ -426,14 +564,18 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
     else:
         command.append(override("+data.apply_chat_template_kwargs.enable_thinking", mode == "thinking"))
 
-    if method == "opd":
+    if method in {'opd', 'adopd'} and not eval_only:
+        teacher_max_prompt = positive_int(cfg, "teacher_max_prompt_length", max_prompt)
+        if adopd:
+            teacher_max_prompt = max_prompt + cfg['adopd_teacher_max_completion_length']
+        teacher_max_seq = teacher_max_prompt + max_response
         command.extend(
             [
                 override("distillation.enabled", True),
                 override("distillation.num_workers", positive_int(cfg, "distillation_num_workers", 8)),
                 override("distillation.teacher_model.enable_resource_pool", strict_bool(cfg, "teacher_enable_resource_pool", False)),
                 override("distillation.teacher_model.n_gpus_per_node", int(cfg.get("teacher_n_gpus_per_node", 0))),
-                override("distillation.teacher_model.nnodes", 1),
+                override("distillation.teacher_model.nnodes", nnodes),
                 override("distillation.teacher_model.model_path", model_reference(
                     str(cfg["teacher_model_path"]),
                     local_files_only=strict_bool(cfg, "local_models_only", False),
@@ -443,21 +585,38 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
                 override("distillation.teacher_model.inference.gpu_memory_utilization", float(cfg.get("teacher_gpu_memory_utilization", 0.3))),
                 # Teacher scores training trajectories only; evaluation prompt
                 # length must not inflate this inherited training-only limit.
-                override("distillation.teacher_model.inference.prompt_length", max_prompt),
-                override("distillation.teacher_model.inference.max_model_len", train_max_seq + 1),
-                override("distillation.teacher_model.inference.max_num_batched_tokens", train_max_seq + 1),
+                override("distillation.teacher_model.inference.prompt_length", teacher_max_prompt),
+                override("distillation.teacher_model.inference.response_length", max_response),
+                override("distillation.teacher_model.inference.max_model_len", teacher_max_seq + 1),
+                override("distillation.teacher_model.inference.max_num_batched_tokens", teacher_max_seq + 1),
                 override("distillation.distillation_loss.loss_mode", cfg.get("distillation_loss_mode", "k1")),
                 override("distillation.distillation_loss.topk", positive_int(cfg, "distillation_topk", 64)),
                 override("distillation.distillation_loss.use_task_rewards", strict_bool(cfg, "distillation_use_task_rewards", False)),
                 override("distillation.distillation_loss.use_policy_gradient", strict_bool(cfg, "distillation_use_policy_gradient", True)),
                 override("distillation.distillation_loss.policy_loss_mode", "vanilla"),
                 override("distillation.distillation_loss.distillation_loss_coef", float(cfg.get("distillation_loss_coef", 1.0))),
-                override("distillation.distillation_loss.loss_max_clamp", float(cfg.get("distillation_loss_max_clamp", 10.0))),
-                override("distillation.distillation_loss.log_prob_min_clamp", float(cfg.get("distillation_log_prob_min_clamp", -10.0))),
+                override("distillation.distillation_loss.loss_max_clamp", None if full_answer_kl else cfg.get("distillation_loss_max_clamp", 10.0)),
+                override("distillation.distillation_loss.log_prob_min_clamp", None if full_answer_kl else cfg.get("distillation_log_prob_min_clamp", -10.0)),
             ]
         )
+        if has_teacher_prompt(cfg):
+            command.extend([
+                override("data.custom_cls.path", "pkg://src.teacher_prompt_dataset"),
+                override("data.custom_cls.name", "TeacherPromptPlaintDataset" if mode == "plaint" else "TeacherPromptDataset"),
+                # Resolve the same path as scoring, including native Hydra model overrides.
+                override("+data.teacher_prompt_filter.model_path", "${distillation.teacher_model.model_path}"),
+                override("+data.teacher_prompt_filter.local_files_only", strict_bool(cfg, "local_models_only", False)),
+                override("+data.teacher_prompt_filter.teacher_prompt", json.dumps(cfg["teacher_prompt"])),
+                override("+data.teacher_prompt_filter.teacher_max_prompt_length", teacher_max_prompt),
+                override("+data.teacher_prompt_filter.teacher_enable_thinking", cfg.get("teacher_enable_thinking", False)),
+            ])
     else:
         command.append(override("distillation.enabled", False))
+
+    for role, values in h100_inference_settings(cfg).items():
+        prefix = ("actor_rollout_ref.rollout" if role == "student"
+                  else "distillation.teacher_model.inference")
+        command.extend(override(f"{prefix}.{key}", value) for key, value in values.items())
 
     if method == "opd":
         extension = opd_options(cfg)
@@ -466,15 +625,42 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
         # recipe to the job and its child actors rather than relying on shell inheritance.
         command.append(override("++ray_kwargs.ray_init.runtime_env.env_vars.OPD_EXTENSIONS_CONFIG",
                                 json.dumps(json.dumps(extension, separators=(",", ":")))))
-        if needs_features(extension):
+        if needs_features(extension) or has_teacher_prompt(extension) or selects_response_tokens(extension):
             command.append(override("++ray_kwargs.ray_init.runtime_env.worker_process_setup_hook",
-                                    "src.opd_runtime.install"))
+                                    "src.opd_h100_runtime.install" if cfg.get("h100_runtime")
+                                    else "src.opd_runtime.install"))
 
+    if adopd:
+        extension = adopd_options(cfg)
+        extension.update(enabled=not eval_only, eval_only=eval_only, group_size=cfg['group_size'],
+                         max_completion_length=max_response,
+                         objective=adopd_objective_name(cfg), h100_runtime=bool(cfg.get('h100_runtime')))
+        feature_options = {}
+        if not eval_only:
+            from src.adopd_cache import cache_identity
+            extension['cache_identity'] = cache_identity(cfg)
+            if full_answer_kl:
+                feature_options = opd_options(cfg)
+                feature_options['feature_cache'] = str(run_dir / 'adopd_teacher_features')
+        command.extend([
+            override('data.custom_cls.path', 'pkg://src.adopd_dataset'),
+            override('data.custom_cls.name', 'AdopdDataset'),
+            override('+data.adopd_reasoning_budget', cfg['adopd_reasoning_budget']),
+            override('actor_rollout_ref.rollout.agent.default_agent_loop', 'adopd_agent'),
+            override('actor_rollout_ref.rollout.agent.agent_loop_config_path', 'configs/adopd_agent.yaml'),
+            override('actor_rollout_ref.actor.ppo_epochs', 1),
+            override('algorithm.rollout_correction', None),
+            override('++ray_kwargs.ray_init.runtime_env.env_vars.ADOPD_CONFIG',
+                     json.dumps(json.dumps(extension, separators=(',', ':')))),
+            override('++ray_kwargs.ray_init.runtime_env.env_vars.OPD_EXTENSIONS_CONFIG', json.dumps(json.dumps(feature_options))),
+            override('++ray_kwargs.ray_init.runtime_env.worker_process_setup_hook', 'src.adopd_runtime.install'),
+        ])
     for item in extra:
         key, _, value = item.partition("=")
         if key.lstrip("+") in {"data.train_files", "data.val_files", "data.cache_dir"}:
             data_references(yaml.safe_load(value))
-    command.extend(extra)
+    command.extend(item for item in extra if item.partition("=")[0].lstrip("+") not in (*OPD_EXTENSION_KEYS, *ADOPD_KEYS))
+    validate_actor_batching(command[3:])
     return command
 
 
@@ -501,6 +687,17 @@ def prepare_model(cfg: dict[str, Any]) -> None:
             source=source,
             local_files_only=strict_bool(cfg, "local_models_only", False),
         )
+
+
+def prepare_teacher_cache_subprocess(cfg: dict[str, Any], env: dict[str, str]) -> None:
+    """Finish cache generation and release its vLLM/CUDA processes before training."""
+    with tempfile.TemporaryDirectory(prefix='adopd-cache-') as directory:
+        path = Path(directory) / 'config.yaml'
+        path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding='utf-8')
+        command = [sys.executable, str(ROOT / 'scripts/run_baseline.py'), str(path),
+                   '--prepare-teacher-cache']
+        print('Preparing missing V2 teacher traces before training...', flush=True)
+        subprocess.run(command, cwd=ROOT, env=env, check=True)
 
 
 def run_training(command: list[str], run_dir: Path, env: dict[str, str], keep: int | None) -> int:
@@ -545,6 +742,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("config", type=Path)
     parser.add_argument("--dry-run", action="store_true", help="validate and print the Hydra command without launching")
     parser.add_argument("--eval-only", action="store_true", help="evaluate the student without training or a teacher")
+    parser.add_argument('--prepare-teacher-cache', action='store_true', help='prepare resumable offline V2 teacher traces, then exit')
+    parser.add_argument('--auto-prepare-teacher-cache', action='store_true',
+                        help='prepare missing V2 traces in a separate process before training')
     parser.add_argument("--resume", type=Path, help="resume from an absolute run or global_step directory")
     args, extra = parser.parse_known_args(argv)
     if extra and extra[0] == "--":
@@ -553,20 +753,39 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("extra arguments after -- must be Hydra key=value overrides")
     if args.resume and args.eval_only:
         parser.error("--resume cannot be combined with --eval-only")
+    if args.prepare_teacher_cache and (args.resume or args.eval_only):
+        parser.error('--prepare-teacher-cache cannot be combined with --resume or --eval-only')
 
     config_path = args.config.resolve() if args.config.exists() else ROOT / args.config
     config_path = resolve_config_path(config_path)
     cfg = load_config(config_path)
+    apply_opd_overrides(cfg, extra)
+    if args.auto_prepare_teacher_cache and cfg['method'] != 'adopd':
+        parser.error('--auto-prepare-teacher-cache requires method: adopd')
     env = load_runtime_env()
     # Credentials never enter the saved recipe or the Hydra command/config.
     legacy_api_key = cfg.pop("wandb_api_key", None)
     wandb_api_key = env.get("WANDB_API_KEY") or legacy_api_key
-    wandb_entity = cfg.get("wandb_entity") or env.get("WANDB_ENTITY") or DEFAULT_WANDB_ENTITY
+    wandb_entity = cfg.get("wandb_entity") or env.get("WANDB_ENTITY")
     cfg["wandb_entity"] = wandb_entity
     cfg["model_path"] = env.get("MODEL_PATH", str(cfg["model_path"]))
-    if cfg["method"] == "opd" and env.get("TEACHER_MODEL_PATH"):
+    if cfg["method"] in {'opd', 'adopd'} and env.get("TEACHER_MODEL_PATH"):
         cfg["teacher_model_path"] = env["TEACHER_MODEL_PATH"]
-    if args.eval_only:
+    if args.prepare_teacher_cache:
+        if cfg['method'] != 'adopd':
+            parser.error('--prepare-teacher-cache requires method: adopd')
+        if extra:
+            unsupported = [item for item in extra if item.partition('=')[0].lstrip('+') not in (*ADOPD_KEYS, *ADOPD_LOSS_KEYS)]
+            if unsupported:
+                parser.error('Cache preparation accepts only ADOPD overrides; edit other settings in the YAML')
+        from src.adopd_cache import prepare
+        prepare(cfg, dry_run=args.dry_run)
+        return 0
+    if args.eval_only and cfg['method'] == 'adopd':
+        cfg['_adopd_eval_only'] = True
+        cfg['experiment_name'] += '_eval'
+        extra += ['trainer.val_before_train=true', 'trainer.val_only=true']
+    elif args.eval_only:
         cfg = {key: value for key, value in cfg.items() if key not in OPD_ONLY_KEYS}
         cfg["method"] = "grpo"
         cfg["experiment_name"] += "_eval"
@@ -595,8 +814,12 @@ def main(argv: list[str] | None = None) -> int:
         "mode": cfg["mode"],
         "config": str(config_path),
         "run_dir": str(run_dir),
-        "distillation_enabled": cfg["method"] == "opd",
+        "distillation_enabled": cfg["method"] in {'opd', 'adopd'} and not args.eval_only,
         "teacher_model": cfg.get("teacher_model_path"),
+        "opd_loss_token_mode": cfg.get("opd_loss_token_mode"),
+        "opd_loss_last_n_tokens": cfg.get("opd_loss_last_n_tokens"),
+        "opd_loss_top_k_divergence": cfg.get("opd_loss_top_k_divergence"),
+        "opd_require_verified": cfg.get("opd_require_verified", False),
         "policy_loss": "vanilla",
         "wandb_enabled": cfg.get("use_wandb", True),
         "wandb_entity": wandb_entity,
@@ -606,6 +829,13 @@ def main(argv: list[str] | None = None) -> int:
         "resume_from": str(resume_checkpoint) if resume_checkpoint else None,
         "max_checkpoints_to_keep": keep,
     }
+    if cfg['method'] == 'adopd':
+        summary.update(adopd_use_group_rollouts=cfg['adopd_use_group_rollouts'],
+                       effective_group_size=cfg['group_size'] if cfg['adopd_use_group_rollouts'] and not args.eval_only else 1,
+                       reasoning_budget=cfg['adopd_reasoning_budget'], response_budget=cfg['max_completion_length'],
+                       length_penalty=cfg['adopd_length_penalty'],
+                       policy_loss=adopd_objective_name(cfg),
+                       prepare_cache_before_training=args.auto_prepare_teacher_cache and not args.eval_only)
     print(json.dumps(summary, indent=2))
     print(shlex.join(command))
     if args.dry_run:
@@ -614,6 +844,16 @@ def main(argv: list[str] | None = None) -> int:
     os.chdir(ROOT)
     preflight(cfg)
     prepare_model(cfg)
+    if cfg['method'] == 'adopd' and not args.eval_only:
+        if args.auto_prepare_teacher_cache:
+            try:
+                prepare_teacher_cache_subprocess(cfg, env)
+            except subprocess.CalledProcessError as exc:
+                print(f'Teacher cache preparation failed (exit {exc.returncode}); training was not started.',
+                      file=sys.stderr, flush=True)
+                return exc.returncode
+        from src.adopd_cache import validate_training_cache
+        print(f'Validated {validate_training_cache(cfg)} cached V2 teacher traces', flush=True)
     run_dir.mkdir(parents=True, exist_ok=args.resume is not None)
     (run_dir / "training_finished.json").unlink(missing_ok=True)
     (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
@@ -640,6 +880,14 @@ def main(argv: list[str] | None = None) -> int:
         extension = opd_options(cfg)
         extension["feature_cache"] = str(run_dir / "opd_teacher_features")
         env["OPD_EXTENSIONS_CONFIG"] = json.dumps(extension)
+    if cfg['method'] == 'adopd':
+        # Use exactly the same values in the driver and all Ray workers.
+        for name in ('ADOPD_CONFIG', 'OPD_EXTENSIONS_CONFIG'):
+            key = f'++ray_kwargs.ray_init.runtime_env.env_vars.{name}='
+            encoded = next(item[len(key):] for item in command if item.startswith(key))
+            env[name] = json.loads(encoded)
+    else:
+        env.pop('ADOPD_CONFIG', None)
     configure_wandb_paths(env, run_dir, strict_bool(cfg, "use_wandb", True))
 
     return_code = run_training(command, run_dir, env, keep)

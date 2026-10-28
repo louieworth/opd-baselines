@@ -2,7 +2,7 @@
 #SBATCH --job-name=qwen3-1.7b-nt-opd-t4b2507
 #SBATCH --account=aip-plbacon
 #SBATCH --partition=gpubase_bynode_b2
-#SBATCH --time=08:00:00
+#SBATCH --time=10:00:00
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=h100:4
@@ -29,6 +29,14 @@ source /home/l/luli/miniconda3/etc/profile.d/conda.sh
 conda activate "$VERL_ENV"
 cd "$REPO_ROOT"
 
+# Read only the W&B entity from .env; keep API credentials out of the job shell.
+if [[ -f "$REPO_ROOT/.env" ]]; then
+    WANDB_ENTITY="$(sed -n 's/^WANDB_ENTITY=//p' "$REPO_ROOT/.env" | head -n 1)"
+    WANDB_ENTITY="${WANDB_ENTITY#\"}"
+    WANDB_ENTITY="${WANDB_ENTITY%\"}"
+    export WANDB_ENTITY
+fi
+
 # Ray services on both nodes must inherit these before the launcher runs.
 export PYTHONPATH="$REPO_ROOT/third_party/verl:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
@@ -38,7 +46,6 @@ export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export HF_DATASETS_CACHE="$REPO_ROOT/data/.cache/huggingface/datasets"
 export WANDB_MODE=offline
-export WANDB_ENTITY=li-jiang-opd
 export WANDB_RUN_ID="slurm-${SLURM_JOB_ID}"
 export WANDB_DIR="$REPO_ROOT"
 export WANDB_DATA_DIR="$REPO_ROOT/wandb/staging"

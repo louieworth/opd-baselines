@@ -1,0 +1,102 @@
+method: opd
+model_path: Qwen/Qwen3-1.7B
+auto_prepare_model: false  # Post-trained student already includes its chat template.
+local_models_only: true  # Use pre-downloaded HF snapshots; no network in SLURM.
+
+project_name: efficient-reasoning
+experiment_name: qwen3_1_7b_thinking_opd_efficient_reasoning_full_vocab_teacher_4b_instruct_2507
+output_dir: /scratch/l/luli/results/onestep
+use_wandb: true
+wandb_mode: offline
+# Sync offline runs to this entity after the SLURM job finishes.
+wandb_entity: null
+
+# 8 GPUs x 16 prompts x 1 response = 128 samples per update, matching paper batch size.
+# The sbatch allocates one node with eight H200 GPUs.
+n_gpus_per_node: 8
+vllm_tensor_parallel_size: 1
+per_device_batch_size: 16
+group_size: 1
+ppo_mini_batch_size: 128
+actor_use_dynamic_bsz: true
+ppo_micro_batch_size_per_gpu: 1  # Static fallback; dynamic batching uses the token budget.
+total_training_steps: null  # Infer from the filtered dataloader and num_epochs.
+num_epochs: 1
+
+learning_rate: 1.0e-6
+warmup_steps: 25
+weight_decay: 0.01
+max_grad_norm: 1.0
+kl_loss_coef: 0.0
+
+max_train_samples: 100000
+max_prompt_length: 2048
+max_completion_length: 16384
+actor_max_token_len_per_gpu: 18432
+
+temperature: 1.0
+top_p: 1.0
+top_k_sampling: -1
+mode: thinking  # Student training and evaluation use enable_thinking=true.
+
+vllm_gpu_memory_utilization: 0.6
+
+# Concise teacher context inspired by CRISP: https://arxiv.org/abs/2603.05433.
+# Use a FIXED external Qwen3-4B-Instruct-2507 teacher; no student weight sync.
+# Preserve the dataset question and boxed-answer instruction in both prompts.
+# The teacher sees only the question, concise instruction, and student response;
+# no ground-truth answer or reference solution is supplied.
+teacher_max_prompt_length: 4096
+teacher_enable_thinking: false  # Instruct-2507 is the non-thinking teacher variant.
+teacher_prompt: >-
+  Solve the problem correctly and concisely. Keep the reasoning steps needed
+  to justify the answer; omit repetition, restating the problem, and unnecessary
+  elaboration. For difficult problems, retain enough detail to avoid mistakes.
+  Follow the original question's final-answer format.
+
+# Teacher scores the student's response (up to max_completion_length=16384);
+# it does not generate a separate response. verl reserves one extra scoring token.
+# Native verl external-teacher distillation.
+teacher_model_path: Qwen/Qwen3-4B-Instruct-2507
+teacher_enable_resource_pool: false
+teacher_n_gpus_per_node: 8
+teacher_tp_size: 4
+teacher_gpu_memory_utilization: 0.3
+distillation_num_workers: 8
+distillation_loss_mode: k1
+distillation_topk: 64
+distillation_use_policy_gradient: true
+distillation_use_task_rewards: false
+distillation_loss_coef: 1.0
+distillation_loss_max_clamp: 10.0
+distillation_log_prob_min_clamp: -10.0
+
+# Vocabulary selection K is distinct from policy_rollout_k and native topk.
+opd_loss_token_mode: full_vocab  # sample | top_k_student | top_k_teacher | top_k_diff | full_vocab
+opd_token_top_k: 32
+opd_enable_metrics: true  # T-S, T-D, S-D overlap; D = topK(p_teacher - p_student).
+opd_distribution_chunk_size: 512
+
+train_files: /scratch/l/luli/data/lightning_opd/train/dapo_math_17k_en.parquet
+val_files:
+  - /scratch/l/luli/data/lightning_opd/eval/amc23.parquet
+  - /scratch/l/luli/data/lightning_opd/eval/aime25.parquet
+  - /scratch/l/luli/data/lightning_opd/eval/aime26.parquet
+  - /scratch/l/luli/data/lightning_opd/eval/hmmt26.parquet
+  - /scratch/l/luli/data/lightning_opd/eval/gpqa_diamond.parquet
+val_before_train: false  # Pass val_before_train=true on the CLI for a step-0 eval.
+eval_steps: 20  # Evals at steps 20, 40, 60, 80, 100 and after the final step.
+val_max_prompt_length: 4096
+val_max_completion_length: 16384
+val_do_sample: true
+val_n: 4
+val_temperature: 1.0
+val_top_p: 1.0
+val_top_k: -1
+val_batch_size: 16
+save_eval_generations: false
+
+save_steps: 25
+# Delete older global_step directories only after the new checkpoint is complete.
+max_checkpoints_to_keep: 1
+checkpoint_save_contents: [model, optimizer, extra, hf_model]

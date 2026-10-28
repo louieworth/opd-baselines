@@ -55,6 +55,10 @@ export VLLM_MOE_USE_DEEP_GEMM=0
 export VLLM_USE_DEEP_GEMM_E8M0=0
 export RAY_SYMMETRIC_RUN_CLUSTER_WAIT_TIMEOUT=300
 export RAY_TMPDIR="/tmp/opd-ray-${SLURM_JOB_ID}"
+# Let verl assign each actor's local rank from Ray's accelerator IDs.  Ray's
+# automatic CUDA_VISIBLE_DEVICES rewrite can collapse fractional-GPU actors
+# onto GPU 0 and make NCCL report duplicate devices.
+export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 export SLURM_EXPORT_ENV=ALL
 
 # The YAML's eight-GPU batch calculation stays intact. Only the physical

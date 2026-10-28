@@ -29,8 +29,14 @@ fsdp_size: -1
 # before the current forward computation.
 forward_prefetch: False
 
-# model dtype of fsdp
+# FP32 sharded optimizer parameters retain small updates across training steps.
 model_dtype: fp32
+
+# The forward/backward compute remains BF16, with FP32 gradient reduction.
+mixed_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  buffer_dtype: fp32
 
 # Whether to use original parameters in fsdp. Only avaiable in fsdp1
 use_orig_params: false

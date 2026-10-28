@@ -11,6 +11,158 @@ before using them.
 Only the prepared Parquet files under `data/train/` and `data/eval/` are tracked
 under `data/`. No other local checkout is needed.
 
+## Qwen3-4B V2 answer-only distillation (ADOPD)
+
+`configs/qwen3_4b_adopd_v2.yaml` implements the V2 reference-teacher method in
+`scripts/suhail_method.pdf` with selectable **sampled-token or full-vocabulary
+reverse KL on answer positions**, using a frozen
+copy of the initial local `Qwen3-4B`. Teacher reference traces are sampled once
+offline and reused throughout training and checkpoint recovery. Both teacher
+and student have a 16,384-token response limit. The student switches to the
+answer after a natural `</think>`, or receives a forced `</think>` after 8,192
+response tokens. The injected token counts toward the response limit and has
+zero policy loss. The answer uses the remaining response budget.
+
+Prepare the shared teacher cache once, then launch the training jobs.
+Cache preparation is resumable and skips cached prompts. It uses every GPU
+specified by `h100_nnodes` and `n_gpus_per_node`: Ray schedules local teacher
+replicas of `teacher_tp_size` GPUs on every node and distributes distinct
+prompt batches across them. The cache is fingerprinted by the frozen weights,
+tokenizer, generation settings, and seed. Preparation runs in a separate process that
+exits before training starts, releasing its vLLM workers and CUDA state.
+Run one cache-preparation job first, then start the training jobs with the
+completed cache. Cache preparation has no global lock.
+
+```bash
+# First: prepare the shared cache once, using all configured nodes/GPUs.
+bash scripts/sbatch/qwen3_4b_adopd_v2.sbatch --prepare-teacher-cache
+# After it completes: train with one or eight rollouts/prompt.
+bash scripts/sbatch/qwen3_4b_adopd_v2.sbatch
+bash scripts/sbatch/qwen3_4b_adopd_v2.sbatch -- adopd_use_group_rollouts=true
+# The same automatic workflow from an existing GPU allocation:
+python scripts/run_baseline.py configs/qwen3_4b_adopd_v2.yaml --auto-prepare-teacher-cache
+```
+
+The `bash` submission entry reads the YAML and passes its node/GPU counts to
+`sbatch`. Set `h100_nnodes: 4` and `n_gpus_per_node: 4` to request and use 16 GPUs
+for cache preparation and training. The same script supports other positive
+node counts; `teacher_tp_size` must divide the GPUs per node. Direct `sbatch`
+submission must request matching resources explicitly; mismatches fail before
+generation instead of leaving allocated nodes unused.
+
+Student training and evaluation prepend the following instruction to the user
+question before applying the thinking chat template:
+
+```text
+<budget:8192>
+Use at most 8192 tokens for reasoning. Finish early when possible.
+```
+
+Both occurrences of 8192 follow `adopd_reasoning_budget`. Prompt-length filtering
+includes this instruction. The same budget is enforced by the two-phase rollout
+and the injected `</think>` token. The V2 teacher always uses the original
+question without this instruction, including cache lookup and answer scoring;
+previously generated teacher traces remain reusable.
+
+Select the answer loss with one hyperparameter:
+
+```yaml
+opd_loss_token_mode: sample # sample | full_vocab
+opd_distribution_chunk_size: 32
+```
+
+`sample` keeps the sampled-token k1 estimator and its existing logprob floor
+and cost clipping. `full_vocab` computes exact reverse KL over the complete
+vocabulary at each sampled answer prefix, using FP32 log-softmax and reductions
+without those floor/clipping approximations. Both modes supervise only answer
+positions. In full-vocabulary mode, teacher answer hidden states are captured
+during the existing scoring pass and reconstructed into logits in chunks of
+`opd_distribution_chunk_size` answer positions. Temporary answer features are
+removed after the actor update. The frozen teacher-trace cache is shared across
+loss modes; changing this hyperparameter does not regenerate reference traces.
+
+The native `distillation_loss_mode: k1` registration remains fixed; the ADOPD
+loss callback implements the choice made by `opd_loss_token_mode`. To override
+the choice for a run:
+
+```bash
+bash scripts/sbatch/qwen3_4b_adopd_v2.sbatch -- opd_loss_token_mode=full_vocab
+# It can also be combined with group rollouts:
+bash scripts/sbatch/qwen3_4b_adopd_v2.sbatch -- opd_loss_token_mode=full_vocab adopd_use_group_rollouts=true
+```
+
+Run-directory names, experiment names, and logged ADOPD settings include the
+chosen loss mode.
+
+The fixed YAML switch is `adopd_use_group_rollouts: false`. Without groups,
+each prompt has one rollout and the objective is answer KL plus
+`adopd_length_penalty * trace_length / 8192`. Its length gradient uses
+single-rollout REINFORCE: detach that length cost and multiply it by the SUM
+of policy-chosen trace-token log probabilities, including a natural halt and
+excluding an injected halt or padding. No group advantage or baseline is
+computed. The sum is essential: averaging trace log probabilities would divide
+out the length signal. The actor uses `cost + (pg - pg.detach())`, so the
+reported loss retains the value `D_g + cost` while backpropagating the length
+policy gradient. Setting `adopd_length_penalty: 0` recovers answer KL alone.
+
+With groups, the
+detached advantage uses `D_g + 0.1 * trace_length / 8192`, normalized by the
+mean and sample standard deviation of all eight rollouts for that prompt.
+Only policy-chosen trace tokens receive its REINFORCE term; the additional
+single-rollout length term is not applied in group mode. Both paths average
+KL over answer tokens within each trajectory, then average trajectories. No
+task-verifier reward enters the objective. The answer loss and the group cost
+both use the selected KL mode. Full-vocabulary group costs are evaluated during
+the old-policy forward before computing the group advantage.
+Training logs separately report `answer_kl`, `length_cost`,
+`regularized_distortion` (the Eq. (5) cost), and `trace_reinforce` under
+`train/adopd/`. In single-rollout mode, the last metric is the value-preserving
+length surrogate; in group mode, it is the Eq. (6) trace term.
+
+`D_g` uses student-generated answer prefixes, with the teacher conditioned on
+its cached trace and the **student's** answer prefix. In `sample` mode,
+both log probabilities are floored at -10 before subtraction and the signed
+difference is clipped to [-10, 10]. Sampled costs can still be negative. The
+answer surrogate is `r * clipped_cost.detach()`, where
+`r = exp(log p_student - log p_old_student)` uses unfloored student log
+probabilities. The group advantage uses the same clipped answer cost.
+Setting both distillation clamp options to null restores the unclipped k1
+estimator with its unit control variate. These sampled-token clamps do not
+apply in `full_vocab` mode. Each rollout batch receives
+one optimizer update; multiple PPO epochs or split optimizer minibatches are
+rejected. Invalid empty-answer trajectories are masked, and a completely
+invalid batch skips the optimizer and scheduler.
+
+Both modes generate 16 trajectories per GPU per update: with eight GPUs this
+is 128 prompts times one response, or 16 prompts times eight. With 16 GPUs it
+is 256 prompts times one response, or 32 prompts times eight. The optimizer
+batch automatically follows the full rollout batch when `ppo_mini_batch_size`
+is null. Each uses one native training epoch over English
+DAPO Math (with the existing dataloader's incomplete-final-batch dropping), so
+group training has approximately eight times as many updates. Training uses
+`/scratch/l/luli/data/lightning_opd/train/dapo_math_17k_en.parquet`; validation
+uses only AIME25, AIME26, and AMC23 from the adjacent `eval/` directory.
+Validation retains the 8k reasoning cutoff and 16k response cap, grades only
+the answer after `</think>`, and reports `avg@4`, `pass@4`, response/reasoning/
+answer lengths, and the forced-halt rate. W&B and run directories distinguish
+the group settings. The default sbatch workflow uses one allocation for both
+stages, sharing its 12-hour time limit. A failed cache-preparation stage stops
+the job before training. On resubmission, completed cache entries are reused;
+use `--resume` to also recover a saved training checkpoint.
+
+```bash
+# These dry runs require no GPUs and do not create a training run.
+python scripts/run_baseline.py configs/qwen3_4b_adopd_v2.yaml --dry-run
+python scripts/run_baseline.py configs/qwen3_4b_adopd_v2.yaml --dry-run -- adopd_use_group_rollouts=true
+python scripts/run_baseline.py configs/qwen3_4b_adopd_v2.yaml --prepare-teacher-cache --dry-run
+
+# MODEL_PATH may point to an exported student checkpoint. Evaluation needs no teacher cache.
+MODEL_PATH=/absolute/path/to/student/hf_model \
+  python scripts/run_baseline.py configs/qwen3_4b_adopd_v2.yaml --eval-only
+# Recovery preserves the frozen teacher and reuses the same cached references.
+python scripts/run_baseline.py configs/qwen3_4b_adopd_v2.yaml --resume /absolute/path/to/run
+```
+
 ## Quick start on the training platform
 
 On this cluster, use the existing `verl` environment (`conda activate verl`).
@@ -60,6 +212,21 @@ platform prepare its own models. Models and caches are excluded from the bundle.
 The packaged OPD objective remains native verl sampled-token `k1` in policy
 gradient mode, with no task-reward term. GRPO uses verifier reward.
 
+All launchers use FP32 sharded actor parameters and AdamW states, BF16
+forward/backward compute, and FP32 gradient reduction. Keeping optimizer
+parameters in FP32 lets 1e-6-scale updates accumulate across steps, matching
+Lightning-OPD's FP32 master weights. Actor losses use `seq-mean-token-mean`:
+average selected tokens within each response, then average responses over the
+global optimizer batch. Distillation refreshes the global normalization counts
+before its first microbatch as well as subsequent ones.
+
+Sampled OPD matches Lightning-OPD's stability settings: floor both student and
+teacher log probabilities at -10, subtract them, and clip the signed cost to
+[-10, 10]. The policy ratio uses the original student log probabilities, so
+the floor does not suppress policy gradients for low-probability tokens.
+These defaults also apply to ADOPD's answer loss. The vocabulary distribution
+losses and diagnostic/selection scores do not use the logprob floor.
+
 ```bash
 # Print the command without downloading models, starting W&B, or claiming GPUs.
 python scripts/run_baseline.py configs/qwen3_4b_base_opd.yaml --dry-run
@@ -84,12 +251,13 @@ The launcher reads the repository-root `.env` automatically. Use:
 
 ```dotenv
 WANDB_API_KEY=<your-api-key>
-WANDB_ENTITY=li-jiang-opd
+WANDB_ENTITY=efficiency-reasoning-with-opd
+WANDB_PROJECT=efficient-reasoning
 WANDB_MODE=offline
 ```
 
 Exported variables take precedence over `.env`. The OPD YAML sets
-`wandb_mode: offline` and `wandb_entity: li-jiang-opd`; the launcher enforces
+`wandb_mode: offline` and `wandb_entity: efficiency-reasoning-with-opd`; the launcher enforces
 offline training even when `WANDB_MODE=online` was inherited. API keys are not
 written into the saved training recipe or launch command. There is no automatic
 upload when training exits.
@@ -105,6 +273,11 @@ python scripts/sync_wandb.py /scratch/l/luli/results/onestep/<run>
 
 The sync script loads `.env`, uploads through `wandb sync`, and skips runs that
 have already been synced or lack the launcher's `training_finished.json` marker.
+The repository-root `.env` must exist and define nonempty `WANDB_ENTITY` and
+`WANDB_PROJECT` values, otherwise syncing (including `--dry-run`) reports an error.
+Sync destinations come from `.env` even when exported variables or offline logs
+specify another destination. Use `--entity` or `--project` to explicitly override
+these settings.
 The marker records the exit code when the training process returns, including
 failed training runs. Actual uploads are refused inside a SLURM job;
 `--dry-run` only prints the commands and never connects to W&B.
@@ -157,6 +330,114 @@ GRPO also has a separate config for each mode:
 Run any of these with `python scripts/run_baseline.py <config>`. They inherit the
 original GRPO training settings and W&B project, with separate output directories
 under `outputs/qwen3_4b/grpo/mode_<mode>/`.
+
+## Thinking student with a concise external teacher
+
+Three efficient-reasoning recipes use `Qwen/Qwen3-1.7B` in thinking mode with
+a fixed `Qwen/Qwen3-4B-Instruct-2507` teacher. They adapt the teacher-only concise
+conditioning idea from [CRISP](https://arxiv.org/abs/2603.05433). Teacher weights
+stay fixed throughout training. The teacher prompt preserves necessary reasoning
+on difficult questions and the dataset's existing boxed-answer instructions.
+Student and evaluation prompts keep their original question/instructions.
+The [teacher model](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) supports
+non-thinking mode; its own chat template is used when constructing teacher inputs.
+
+| OPD loss token mode | YAML | sbatch |
+| --- | --- | --- |
+| `sample` | [config](configs/qwen3_1_7b_thinking_opd_efficient_reasoning_sample.yaml) | [script](scripts/sbatch/qwen3_1_7b_thinking_opd_efficient_reasoning_sample.sbatch) |
+| `full_vocab` | [config](configs/qwen3_1_7b_thinking_opd_efficient_reasoning_full_vocab.yaml) | [script](scripts/sbatch/qwen3_1_7b_thinking_opd_efficient_reasoning_full_vocab.sbatch) |
+| `top_k_diff` | [config](configs/qwen3_1_7b_thinking_opd_efficient_reasoning_top_k_diff.yaml) | [script](scripts/sbatch/qwen3_1_7b_thinking_opd_efficient_reasoning_top_k_diff.sbatch) |
+
+All three retain the existing OPD data, 256 prompts × 1 response, one epoch,
+two nodes with four H100 GPUs each, vocabulary metrics, and `opd_token_top_k: 32`.
+Training student prompts allow 2,048 tokens; teacher prompts allow 4,096 tokens.
+Data loading first filters student prompts, then filters teacher prompts using
+the teacher's tokenizer, concise instruction, and chat template. A training
+sample is kept only when both limits are satisfied; prompts are not truncated.
+The same filtering runs when training data is reloaded for checkpoint recovery.
+Validation uses only its student prompt limit and is not filtered by the teacher.
+Training and evaluation responses allow 16,384 tokens, with `val_n: 1` and the
+existing 4,096-token validation prompt limit. Teacher scoring consumes the full
+student response under the teacher prompt, so its context capacity is 20,481
+tokens including verl's one extra scoring token. There is no separate teacher
+response rollout. Response predictions and cached features are aligned by their
+own prompt boundaries before computing the inherited OPD loss.
+
+Submit any desired variant, or all three:
+
+```bash
+for mode in sample full_vocab top_k_diff; do
+  sbatch "scripts/sbatch/qwen3_1_7b_thinking_opd_efficient_reasoning_${mode}.sbatch"
+done
+```
+
+Use `teacher_prompt`, `teacher_max_prompt_length`, and
+`teacher_enable_thinking` to configure the teacher-only context. These settings
+are propagated to the Ray workers, support launcher overrides, and require
+the shared teacher resource pool (`teacher_enable_resource_pool: false`).
+Each variant has a distinct W&B experiment name and output-directory suffix.
+
+Two additional sample variants train only the last 100 valid response tokens:
+
+| Config suffix | Training trajectories |
+| --- | --- |
+| `sample_last100` | All generated trajectories |
+| `sample_last100_verified` | Only trajectories whose answer verifier returns `acc == 1` |
+
+Both inherit `qwen3_1_7b_thinking_opd_efficient_reasoning_sample.yaml`. Earlier
+response tokens remain visible to student and teacher as causal context, with
+zero token loss. Responses shorter than 100 tokens use all their valid tokens;
+padding is excluded and the termination token is included when valid. The
+verified variant uses the existing boxed-answer verifier on the complete
+trajectory, without adding ground truth to the teacher prompt. Rejected
+trajectories have zero loss, and batches with no selected tokens skip the
+optimizer and LR scheduler update. Filtering does not refill the rollout batch.
+Validation still scores full responses with the baseline settings.
+
+The YAML options are `opd_loss_last_n_tokens: 100` and
+`opd_require_verified: true`/`false`; their defaults preserve the original loss.
+W&B records selected/filtered trajectory counts, loss-token counts, and skipped
+updates under `train/opd/`. The new configurations and output directories have
+distinct names. Submit either variant with the same two-node, four-H100-per-node
+layout as the sample baseline:
+
+```bash
+sbatch scripts/sbatch/qwen3_1_7b_thinking_opd_efficient_reasoning_sample_last100_verified.sbatch
+sbatch scripts/sbatch/qwen3_1_7b_thinking_opd_efficient_reasoning_sample_last100.sbatch
+```
+
+### Top-1 divergence sample OPD on eight H100 GPUs
+
+`configs/qwen3_1_7b_thinking_opd_efficient_reasoning_sample_divergence_top1_h100_8gpu_train.yaml`
+keeps the full-vocabulary eight-H100 recipe's data, teacher prompt, global batch
+of 128, response lengths, and evaluation settings, and changes the objective to
+native sampled-token `k1` OPD with `opd_loss_top_k_divergence: 1`.
+For each complete response, rank valid sampled tokens by
+`abs(log p_teacher(y_t) - log p_old_student(y_t))` and keep one position for
+the actor loss. Scores use unclipped log probabilities before the actor update;
+ties select the earliest position, padding is excluded, and an empty response
+contributes no loss. The native sample loss keeps its own clipping and
+policy-gradient behavior, averaging selected tokens within each response and
+then responses over the global batch. Full causal context
+and evaluation responses are retained.
+
+This adapts the absolute log-likelihood difference in
+[HDL, Equation (2)](https://arxiv.org/html/2609.36864v1#S3.SS2)
+to the fixed OPD teacher and rollout student. It uses the existing teacher prompt
+and does not generate hindsight reflections or branched rollouts.
+W&B records selected-token counts and selected divergence scores under
+`train/opd/`, in project `efficient-reasoning`.
+
+The two-node, four-H100-per-node job has a ten-hour walltime limit:
+
+```bash
+sbatch scripts/sbatch/qwen3_1_7b_thinking_opd_efficient_reasoning_sample_divergence_top1_h100_8gpu_train.sbatch
+```
+
+`scripts/run_h100_8gpu_opd.py` uses the shared launcher with explicit
+`h100_nnodes` and student/teacher `h100_runtime` settings, including eager mode,
+chunked prefill, and the H100 reporting/cache-release hooks. The YAML can also
+be validated with this launcher's `--dry-run` option.
 
 ## Prepared data and reproduction
 
@@ -349,7 +630,8 @@ opd_enable_metrics: true
 opd_distribution_chunk_size: 32
 ```
 
-- `sample`: retain native verl k1 policy-gradient loss, clipping and reduction.
+- `sample`: native k1 policy-gradient loss with Lightning-OPD floors, clipping,
+  and per-response token means followed by a global response mean.
 - `top_k_student`: select K largest next-token student probabilities.
 - `top_k_teacher`: select K largest next-token teacher probabilities.
 - `top_k_diff`: select K largest signed full-vocabulary differences p_teacher − p_student.
@@ -361,7 +643,7 @@ teacher). This is a distribution loss, rather than the native sampled-token PPO
 loss. Teacher probabilities are detached. Distribution losses use the native
 `distillation_loss_max_clamp` (10); the native logprob floor (-10) applies to
 sample loss only, so it does not distort the selected distributions or metrics.
-Native training parameters and loss reduction stay unchanged.
+All vocabulary modes use the shared `seq-mean-token-mean` loss reduction.
 
 The three response-token overlap metrics use T=topK(teacher), S=topK(student),
 D=topK(p_teacher − p_student). Each is 100 × intersection size / K, averaged
@@ -380,7 +662,7 @@ The run config records `training_framework: verl` and OPD-only vocabulary
 options when applicable. Both methods record prompt visits and response samples
 cumulatively; `eval/cumulative_response_samples` gives the shared trajectory
 budget at each evaluation. Runs remain offline in project `opd`, entity
-`li-jiang-opd`; preparation does not upload W&B runs.
+`efficiency-reasoning-with-opd`; preparation does not upload W&B runs.
 
 Exact difference metrics require both full next-token distributions. An opt-in
 Ray worker hook captures the teacher's final response hidden states during its

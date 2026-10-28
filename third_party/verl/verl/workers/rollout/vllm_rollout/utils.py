@@ -133,6 +133,12 @@ class vLLMColocateWorkerExtension:
     2. Online FP8 quantization
     """
 
+    def install_on_worker(self, cache_root: str):
+        """Install OPD capture through vLLM's named collective RPC API."""
+        from src.opd_vllm_capture import install_on_worker as install_capture
+
+        return install_capture(self, cache_root)
+
     def __new__(cls, **kwargs):
         set_death_signal()
 

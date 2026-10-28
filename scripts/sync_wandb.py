@@ -9,10 +9,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from dotenv import dotenv_values
+
 if __package__:
-    from .runtime_env import DEFAULT_WANDB_ENTITY, ROOT, WANDB_ROOT, load_runtime_env
+    from .runtime_env import ROOT, WANDB_ROOT, load_runtime_env
 else:
-    from runtime_env import DEFAULT_WANDB_ENTITY, ROOT, WANDB_ROOT, load_runtime_env
+    from runtime_env import ROOT, WANDB_ROOT, load_runtime_env
 
 
 def training_run_root(directory: Path, records: list[Path]) -> Path | None:
@@ -57,10 +59,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", type=Path, nargs="?", default=WANDB_ROOT,
                         help="training run, W&B offline-run directory, or output tree")
-    parser.add_argument("--entity", help="W&B entity (default: WANDB_ENTITY or li-jiang-opd)")
-    parser.add_argument("--project", help="override the project recorded in the offline run")
+    parser.add_argument("--entity", help="override WANDB_ENTITY from the repository .env")
+    parser.add_argument("--project", help="override WANDB_PROJECT from the repository .env")
     parser.add_argument("--dry-run", action="store_true", help="print uploads without connecting to W&B")
     args = parser.parse_args(argv)
+    env_path = ROOT / ".env"
+    if not env_path.is_file():
+        parser.error(f"Required configuration file does not exist: {env_path}")
+    sync_config = dotenv_values(env_path, interpolate=False)
+    for key in ("WANDB_ENTITY", "WANDB_PROJECT"):
+        if not (sync_config.get(key) or "").strip():
+            parser.error(f"{key} must be set to a non-empty value in {env_path}")
+    entity = args.entity or sync_config["WANDB_ENTITY"].strip()
+    project = args.project or sync_config["WANDB_PROJECT"].strip()
     env = load_runtime_env()
     if env.get("SLURM_JOB_ID") and not args.dry_run:
         parser.error("Sync after the SLURM job finishes, from the login node outside the job")
@@ -71,16 +82,14 @@ def main(argv: list[str] | None = None) -> int:
     if not runs:
         print("No completed, unsynced offline W&B runs found.")
         return 0
-    entity = args.entity or env.get("WANDB_ENTITY") or DEFAULT_WANDB_ENTITY
     # Only this explicit upload command uses online mode. Training stays offline.
     env["WANDB_MODE"] = "online"
     env["WANDB_ENTITY"] = entity
+    env["WANDB_PROJECT"] = project
     exit_code = 0
     for directory in runs:
-        command = [sys.executable, "-m", "wandb", "sync", "--entity", entity,
+        command = [sys.executable, "-m", "wandb", "sync", "--entity", entity, "--project", project,
                    "--include-offline", "--no-include-online", "--no-include-synced", "--mark-synced"]
-        if args.project:
-            command += ["--project", args.project]
         command.append(str(directory))
         print(shlex.join(command), flush=True)
         if not args.dry_run:

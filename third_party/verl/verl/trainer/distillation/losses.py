@@ -232,6 +232,13 @@ def distillation_loss(
     - distillation_metrics: Dictionary of metrics.
     """
     assert distillation_config is not None
+    # Distillation runs BEFORE ppo_loss, which normally initializes these stats.
+    # Refresh them here for every microbatch, including the very first one, so
+    # neither local sequence counts nor a previous batch's counts set its weight.
+    for key in ("dp_size", "batch_num_tokens", "global_batch_size"):
+        if key in data:
+            config.global_batch_info[key] = data[key]
+    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
     distillation_loss_fn = get_distillation_loss_fn(loss_config.loss_mode)
     distillation_losses, distillation_metrics = distillation_loss_fn(
@@ -256,7 +263,7 @@ def distillation_loss(
         for k, v in config.global_batch_info.items():
             loss_config.global_batch_info[k] = v
         log_prob = no_padding_2_padding(model_output["log_probs"], data)
-        old_log_prob = data["old_log_probs"]
+        old_log_prob = data["old_log_probs"].detach()
         rollout_is_weights = data.get("rollout_is_weights", None)
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
@@ -338,12 +345,18 @@ def compute_distillation_loss_reverse_kl_estimator(
     - distillation_losses: (bsz, resp_len)
     - distillation_metrics: Dictionary of metrics.
     """
-    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
-    teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+    student_log_probs = no_padding_2_padding(model_output["log_probs"], data).float()
+    teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1).float()
     response_mask_bool = data["response_mask"].bool()
     assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
 
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
+    if loss_config.log_prob_min_clamp is not None:
+        # Match Slime sampled_advantage: floor BOTH sampled log probabilities
+        # before taking their difference. Policy-gradient mode detaches this
+        # cost, while its PPO ratio still uses the original, unfloored log q.
+        student_log_probs = student_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+        teacher_log_probs = teacher_log_probs.clamp_min(loss_config.log_prob_min_clamp)
     distillation_losses = kl_penalty(
         logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty=loss_config.loss_mode
     )

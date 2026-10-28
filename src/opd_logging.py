@@ -15,17 +15,21 @@ def comparable_metrics(metrics, step):
                          ('actor/distillation/ppo_kl', 'train/ppo_kl')]:
             if old in metrics:
                 result[new] = metrics[old]
+        for name in ('selected_trajectories', 'filtered_trajectories', 'loss_tokens', 'update_skipped',
+                     'selected_divergence_mean', 'selected_divergence_max'):
+            key = 'actor/opd/' + name
+            if key in metrics:
+                result['train/opd/' + name] = metrics[key]
         denominator = metrics.get('actor/opd/valid_tokens', 0)
+        for key, value in metrics.items():
+            if key.startswith('actor/adopd/'):
+                result['train/' + key[len('actor/'):]] = value
         if denominator:
             for key, value in metrics.items():
                 if key.startswith('actor/opd/') and key.endswith('_pct_sum'):
                     result['train/' + key[len('actor/'):-4]] = value / denominator
     if any(key.startswith('eval/') for key in metrics):
         result['eval/step'] = step  # Evaluations follow this many completed updates.
-        for key, value in metrics.items():
-            if key.startswith('eval/') and key.endswith('/avg@1'):
-                source = key[len('eval/'):-len('/avg@1')]
-                result[f'eval_metric/{source}-avg@1'] = value
     for old, new in [('timing_s/gen', 'perf/rollout_time'), ('timing_s/teacher', 'perf/teacher_time'),
                      ('timing_s/update_actor', 'perf/actor_train_time'),
                      ('timing_s/update_weights', 'perf/update_weights_time'), ('timing_s/step', 'perf/step_time')]:
@@ -49,13 +53,15 @@ def install_tracking():
                 config = deepcopy(config)
                 if config.get('distillation', {}).get('enabled', False):
                     config['opd_extensions'] = json.loads(os.environ.get('OPD_EXTENSIONS_CONFIG', '{}'))
+                if os.environ.get('ADOPD_CONFIG'):
+                    config['adopd'] = json.loads(os.environ['ADOPD_CONFIG'])
                 config['training_framework'] = 'verl'
                 self._opd_batch = (config['data']['train_batch_size'],
                                    config['actor_rollout_ref']['rollout']['n'])
             super().__init__(*args, config=config, **kwargs)
             if 'wandb' in self.logger:
                 wandb = self.logger['wandb']
-                for namespace, axis in [('train', 'train/step'), ('eval', 'eval/step'), ('eval_metric', 'eval/step')]:
+                for namespace, axis in [('train', 'train/step'), ('eval', 'eval/step')]:
                     wandb.define_metric(axis)
                     wandb.define_metric(namespace+'/*', step_metric=axis)
 

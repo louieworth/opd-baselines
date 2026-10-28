@@ -2,6 +2,7 @@
 
 import asyncio
 from functools import lru_cache, wraps
+import gc
 import json
 import os
 from pathlib import Path
@@ -10,13 +11,26 @@ from uuid import uuid4
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 from src.opd_math import METRIC_NAMES, distribution_metrics, reverse_kl_loss
-from src.opd_options import needs_features, runtime_options
-from src.opd_vllm_capture import install_on_worker, sequence_key
+from src.opd_options import needs_features, runtime_options, selects_response_tokens
+from src.opd_vllm_capture import sequence_key
+from src.teacher_prompt import has_teacher_prompt, teacher_prompt_ids
 
 _HEADS = {}
+
+
+def _release_teacher_heads(opts):
+    """Return unused actor memory before the colocated vLLM restores its weights."""
+    _HEADS.clear()
+    if not needs_features(opts):
+        return
+    gc.collect()
+    if torch.cuda.is_available():
+        # Wait for work on every stream before returning cached blocks to CUDA.
+        # Removing the head reference alone leaves its storage in PyTorch's pool.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 def cache_root():
@@ -28,7 +42,57 @@ def cpu_head(path):
     return torch.load(path, map_location='cpu', weights_only=True, mmap=True)
 
 
-def packed_outputs(student_logits, data, config):
+class _ChunkedDistributionOutputs(torch.autograd.Function):
+    """Recompute chunk gradients into one buffer instead of full-size SliceBackward buffers."""
+
+    @staticmethod
+    def forward(ctx, logits, hidden, weight, bias, start, opts, maximum):
+        ctx.save_for_backward(logits, hidden, weight, bias)
+        ctx.start, ctx.opts, ctx.maximum = start, dict(opts), maximum
+        ctx.set_materialize_grads(False)
+        rows = [[] for _ in range((len(METRIC_NAMES) if opts['opd_enable_metrics'] else 0) + 1)]
+        for first in range(0, len(hidden), opts['opd_distribution_chunk_size']):
+            last = min(len(hidden), first + opts['opd_distribution_chunk_size'])
+            student = logits[0, start + first:start + last]
+            features = hidden[first:last].to(device=weight.device, dtype=weight.dtype)
+            teacher = F.linear(features, weight, bias)
+            values = []
+            if opts['opd_enable_metrics']:
+                values.extend(distribution_metrics(student, teacher, opts['opd_token_top_k']).values())
+            values.append(reverse_kl_loss(student, teacher, opts['opd_loss_token_mode'],
+                                          opts['opd_token_top_k'], maximum))
+            for row, value in zip(rows, values, strict=True):
+                row.append(value)
+        outputs = tuple(torch.cat(row) for row in rows)
+        ctx.mark_non_differentiable(*outputs[:-1])
+        return outputs
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        loss_gradient = grad_outputs[-1]
+        if loss_gradient is None:
+            return (None,) * 7
+        logits, hidden, weight, bias = ctx.saved_tensors
+        opts, start = ctx.opts, ctx.start
+        # Each response chunk used to send a dense, sequence-sized gradient
+        # through SliceBackward/SelectBackward and their accumulation. Allocate
+        # this buffer once, and detach each chunk before building its local graph.
+        gradient = torch.zeros_like(logits)
+        for first in range(0, len(hidden), opts['opd_distribution_chunk_size']):
+            last = min(len(hidden), first + opts['opd_distribution_chunk_size'])
+            with torch.no_grad():
+                features = hidden[first:last].to(device=weight.device, dtype=weight.dtype)
+                teacher = F.linear(features, weight, bias)
+            with torch.enable_grad():
+                student = logits[0, start + first:start + last].detach().requires_grad_(True)
+                losses = reverse_kl_loss(student, teacher, opts['opd_loss_token_mode'],
+                                         opts['opd_token_top_k'], ctx.maximum)
+                chunk_gradient, = torch.autograd.grad(losses, student, loss_gradient[first:last])
+            gradient[0, start + first:start + last] = chunk_gradient
+        return gradient, None, None, None, None, None, None
+
+
+def packed_outputs(student_logits, data, config, *, answer_only=False):
     """Align each response with its preceding next-token prediction position."""
     opts = runtime_options()
     tokens = data['input_ids']
@@ -42,9 +106,25 @@ def packed_outputs(student_logits, data, config):
         outputs['opd_kl'] = []
     for i, reference in enumerate(references):
         ids = tokens[i]
+        if reference is None:
+            # ADOPD can retain an empty-answer trajectory for DP collectives.
+            zero = student_logits[0, offsets[i]:offsets[i + 1], 0] * 0.0
+            for row in outputs.values():
+                row.append(zero)
+            continue
         artifact = torch.load(reference['path'], map_location='cpu', weights_only=True, mmap=True)
         p, r = reference['prompt_length'], reference['response_length']
-        if len(ids) != p + r or not torch.equal(ids.detach().cpu(), artifact['input_ids']):
+        response_offset = reference.get('response_offset', 0)
+        if not 0 <= response_offset < r:
+            raise ValueError('Invalid teacher feature response offset')
+        feature_length = r - response_offset
+        if 'student_sequence_key' in reference:
+            matches = (sequence_key(ids.detach().cpu().tolist(), r) == reference['student_sequence_key']
+                       and sequence_key(artifact['input_ids'].tolist(), feature_length) == reference['teacher_sequence_key']
+                       and artifact['prompt_length'] == reference['teacher_prompt_length'])
+        else:
+            matches = torch.equal(ids.detach().cpu(), artifact['input_ids'])
+        if len(ids) != p + r or not matches:
             raise ValueError('Teacher feature tokens/prompt boundary do not match this training sample.')
         head_path = reference['head_path']
         key = (head_path, str(student_logits.device))
@@ -56,8 +136,16 @@ def packed_outputs(student_logits, data, config):
         if student_logits.size(-1) != weight.size(0):
             raise ValueError('OPD teacher/student vocabulary sizes differ.')
         hidden = artifact['hidden_states']
-        if hidden.size(0) != r or not torch.equal(artifact['response_tokens'], ids[p:].detach().cpu()):
+        if hidden.size(0) != feature_length or not torch.equal(artifact['response_tokens'], ids[p + response_offset:].detach().cpu()):
             raise ValueError('Teacher response hidden states are misaligned.')
+        if mode != 'sample':
+            values = _ChunkedDistributionOutputs.apply(
+                student_logits, hidden, weight, bias, offsets[i] + p + response_offset - 1, opts,
+                None if answer_only else config.distillation_loss.loss_max_clamp,
+            )
+            for name, value in zip(outputs, values, strict=True):
+                outputs[name].append(F.pad(value, (p + response_offset - 1, 1)))
+            continue
         chunks = {name: [] for name in outputs}
 
         def run(student, features, weight=weight, bias=bias):
@@ -74,11 +162,8 @@ def packed_outputs(student_logits, data, config):
             end = min(r, start + opts['opd_distribution_chunk_size'])
             student = student_logits[0, offsets[i] + p - 1 + start:offsets[i] + p - 1 + end]
             features = hidden[start:end].to(student.device)
-            if mode == 'sample':
-                with torch.no_grad():
-                    values = run(student.detach(), features)
-            else:
-                values = checkpoint(run, student, features, use_reentrant=False)
+            with torch.no_grad():
+                values = run(student.detach(), features)
             for name, value in zip(chunks, values, strict=True):
                 chunks[name].append(value)
         for name in outputs:
@@ -97,6 +182,45 @@ def vocabulary_loss(config, distillation_config, model_output=None, data=None, d
     opts = runtime_options()
     if student_logits is not None:
         return packed_outputs(student_logits, data, distillation_config)
+    if selects_response_tokens(opts):
+        # Native distillation runs before ppo_loss initializes these statistics.
+        # Refresh them for every microbatch so the selected loss is normalized by
+        # current global selected-token count or trajectory count, according to
+        # the actor's aggregation mode, including on step one.
+        config.global_batch_info.update(dp_size=data['dp_size'],
+                                        batch_num_tokens=data['batch_num_tokens'],
+                                        global_batch_size=data['global_batch_size'],
+                                        loss_scale_factor=config.loss_scale_factor)
+        if not data['response_mask'].bool().any():
+            # A DP rank/microbatch may contain only rejected trajectories.
+            # Keep its forward/backward collectives, with no token gradients;
+            # native min/max reductions cannot handle an empty selection.
+            # Obtain the native metric schema on a throwaway mask so every DP
+            # rank reports the same metric keys and accumulation counts.
+            probe = data.clone(recurse=False)
+            probe_mask = torch.zeros_like(data['response_mask'])
+            probe_mask[0, 0] = 1
+            probe['response_mask'] = probe_mask
+            with torch.no_grad():
+                if opts['opd_loss_token_mode'] == 'sample':
+                    _, metrics = native.distillation_ppo_loss(config, distillation_config, model_output, probe, dp_group)
+                else:
+                    _, metrics = ppo_loss(config, model_output, probe, dp_group)
+                    metrics['distillation/loss'] = Metric(AggregationType.SUM, 0.0)
+            for name, metric in metrics.items():
+                if isinstance(metric, Metric):
+                    neutral = {AggregationType.MIN: float('inf'), AggregationType.MAX: -float('inf')}
+                    metrics[name] = Metric(metric.aggregation, neutral.get(metric.aggregation, 0.0))
+                else:
+                    metrics[name] = 0.0
+            log_probs = model_output['log_probs']
+            values = log_probs.values() if log_probs.is_nested else log_probs
+            zero = values.sum() * 0.0
+            if opts['opd_enable_metrics']:
+                metrics['opd/valid_tokens'] = Metric(AggregationType.SUM, zero.detach())
+                metrics.update({name + '_sum': Metric(AggregationType.SUM, zero.detach())
+                                for name in METRIC_NAMES})
+            return zero, metrics
     if opts['opd_loss_token_mode'] == 'sample':
         # Preserve k1/PPO, task-reward and clipping behavior exactly.
         loss, metrics = native.distillation_ppo_loss(config, distillation_config, model_output, data, dp_group)
@@ -123,22 +247,46 @@ async def teacher_batch(self, data):
 
     multimodal = data.non_tensor_batch.get('teacher_multi_modal_data')
     prompt_width, response_width = data.batch['prompts'].shape[1], data.batch['responses'].shape[1]
-    root = cache_root()
+    opts = runtime_options()
+    features = needs_features(opts)
+    root = cache_root() if features else None
 
     async def score(i):
         ids, p, r = _unpad_teacher_inputs(data[i:i+1])
         if multimodal is not None and multimodal[i]:
             raise ValueError('OPD vocabulary extensions currently support text-only teacher scoring.')
+        teacher_input, teacher_p = ids, p
+        if has_teacher_prompt(opts):
+            prompt = teacher_prompt_ids(self._opd_tokenizer, data.non_tensor_batch['raw_prompt'][i], opts)
+            teacher_input, teacher_p = prompt + ids[p:], len(prompt)
         # Keep native sampled-token teacher outputs. Vocabulary targets come from captured features.
-        params = dict(max_tokens=1, temperature=1.0, prompt_logprobs=0, _opd_response_length=r)
-        result = await self.generate(request_id=sequence_key(ids, r), prompt_ids=ids, sampling_params=params)
-        key = sequence_key(ids, r)
-        reference = dict(path=str(root/key[:2]/(key+'.pt')), head_path=str(root/'output_head.pt'),
-                         prompt_length=p, response_length=r)
-        if not Path(reference['path']).is_file():
-            raise RuntimeError('vLLM did not produce the required teacher hidden-state cache.')
+        params = dict(max_tokens=1, temperature=1.0, prompt_logprobs=0)
+        if features:
+            params['_opd_response_length'] = r
+        result = await self.generate(request_id=sequence_key(teacher_input, r), prompt_ids=teacher_input,
+                                     sampling_params=params)
+        reference = None
+        if features:
+            key = sequence_key(teacher_input, r)
+            reference = dict(path=str(root/key[:2]/(key+'.pt')), head_path=str(root/'output_head.pt'),
+                             prompt_length=p, response_length=r)
+            if has_teacher_prompt(opts):
+                reference.update(student_sequence_key=sequence_key(ids, r), teacher_sequence_key=key,
+                                 teacher_prompt_length=teacher_p)
+            if not Path(reference['path']).is_file():
+                raise RuntimeError('vLLM did not produce the required teacher hidden-state cache.')
         teacher_ids = torch.tensor(result.extra_fields['prompt_ids'], dtype=torch.int32)
         logprobs = torch.tensor(result.extra_fields['prompt_logprobs'])
+        if teacher_ids.shape[0] != len(teacher_input) or logprobs.shape[0] != len(teacher_input):
+            raise ValueError('Teacher prompt-logprob output length does not match the scoring input')
+        if has_teacher_prompt(opts):
+            # vLLM row j predicts token j+1. Map only response predictions back
+            # into the student's prompt/response frame before native padding.
+            aligned_ids = teacher_ids.new_zeros((p + r, teacher_ids.size(-1)))
+            aligned_logprobs = logprobs.new_zeros((p + r, logprobs.size(-1)))
+            aligned_ids[p-1:p+r-1] = teacher_ids[teacher_p-1:teacher_p+r-1]
+            aligned_logprobs[p-1:p+r-1] = logprobs[teacher_p-1:teacher_p+r-1]
+            teacher_ids, logprobs = aligned_ids, aligned_logprobs
         padded = _pad_teacher_outputs(teacher_ids, logprobs, prompt_width, response_width, p, r, self.pad_token_id)
         return padded, reference
 
@@ -146,11 +294,19 @@ async def teacher_batch(self, data):
     return DataProto(batch=TensorDict(dict(teacher_ids=torch.cat([item[0][0] for item in results]),
                                          teacher_logprobs=torch.cat([item[0][1] for item in results])),
                                     batch_size=len(data)),
-                     non_tensor_batch={'opd_teacher_features': np.array([item[1] for item in results], dtype=object)})
+                     non_tensor_batch=({'opd_teacher_features': np.array([item[1] for item in results], dtype=object)}
+                                       if features else {}))
 
 
 def install():
-    if not needs_features(runtime_options()):
+    opts = runtime_options()
+    if has_teacher_prompt(opts):
+        from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
+        AsyncTeacherLLMServerManager.compute_teacher_logprobs_batch = teacher_batch
+    if selects_response_tokens(opts):
+        from verl.workers import engine_workers
+        engine_workers.distillation_ppo_loss = vocabulary_loss
+    if not needs_features(opts):
         return
     from verl.workers import engine_workers
     if getattr(engine_workers, '_opd_extensions_installed', False):
@@ -171,7 +327,8 @@ def install():
                 self._opd_install_lock = asyncio.Lock()
             async with self._opd_install_lock:
                 if not getattr(self, '_opd_capture_installed', False):
-                    await self.engine.collective_rpc(install_on_worker, args=(str(cache_root()),))
+                    # vLLM 0.12 serializes this RPC; use the worker extension's named method.
+                    await self.engine.collective_rpc('install_on_worker', args=(str(cache_root()),))
                     self._opd_capture_installed = True
             request_id = f'opdfeat-{sequence_key(prompt_ids, response_length)}-{response_length}-{uuid4().hex}'
         return await original_generate(self, prompt_ids=prompt_ids, sampling_params=params,
@@ -185,7 +342,7 @@ def install():
         try:
             return original_update(self, *args, **kwargs)
         finally:
-            _HEADS.clear()  # Release teacher heads before vLLM is woken on these GPUs.
+            _release_teacher_heads(opts)
 
     engine_workers.ActorRolloutRefWorker.update_actor = update_actor
     engine_workers._opd_extensions_installed = True

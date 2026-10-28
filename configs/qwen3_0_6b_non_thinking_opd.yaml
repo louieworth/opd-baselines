@@ -3,22 +3,21 @@ model_path: Qwen/Qwen3-0.6B
 auto_prepare_model: false  # Post-trained student already includes its chat template.
 local_models_only: true  # Use pre-downloaded HF snapshots; no network in SLURM.
 
-project_name: opd
+project_name: onestep-opd
 experiment_name: qwen3_0_6b_non_thinking_opd_teacher_4b_instruct_2507
 output_dir: /scratch/l/luli/results/onestep
 use_wandb: true
 wandb_mode: offline
 # Sync offline runs to this entity after the SLURM job finishes.
-wandb_entity: li-jiang-opd
+wandb_entity: null
 
-# 8 GPUs x 32 prompts x 1 response = 256 samples per update.
-# User-selected 256 prompts x 1; independent of Lightning standard OPD's 64 x 4.
+# 8 GPUs x 16 prompts x 1 response = 128 samples per update, matching paper batch size.
 # The two-node sbatch overrides the physical layout to 2 x 4 GPUs.
 n_gpus_per_node: 8
 vllm_tensor_parallel_size: 1
-per_device_batch_size: 32
+per_device_batch_size: 16
 group_size: 1
-ppo_mini_batch_size: 256
+ppo_mini_batch_size: 128
 total_training_steps: null  # Infer from the filtered dataloader and num_epochs.
 num_epochs: 1
 
@@ -61,24 +60,22 @@ opd_token_top_k: 32
 opd_enable_metrics: true  # T-S, T-D, S-D overlap; D = topK(p_teacher - p_student).
 opd_distribution_chunk_size: 32
 
-train_files: /scratch/l/luli/data/lightning_opd/train/dapo_math_17k.parquet
+train_files: /scratch/l/luli/data/lightning_opd/train/dapo_math_17k_en.parquet
 val_files:
   - /scratch/l/luli/data/lightning_opd/eval/amc23.parquet
-  - /scratch/l/luli/data/lightning_opd/eval/math500.parquet
+  - /scratch/l/luli/data/lightning_opd/eval/aime25.parquet
   - /scratch/l/luli/data/lightning_opd/eval/aime26.parquet
   - /scratch/l/luli/data/lightning_opd/eval/hmmt26.parquet
-  - /scratch/l/luli/data/lightning_opd/eval/mmlu_college_chemistry.parquet
-  - /scratch/l/luli/data/lightning_opd/eval/mmlu_college_medicine.parquet
   - /scratch/l/luli/data/lightning_opd/eval/gpqa_diamond.parquet
-val_before_train: true
-eval_steps: 15  # Also evaluate before training and after the final step.
+val_before_train: false  # Pass val_before_train=true on the CLI for a step-0 eval.
+eval_steps: 20  # Evals at steps 20, 40, 60, 80, 100 and after the final step.
 val_max_prompt_length: 4096
 val_max_completion_length: 16384
 val_do_sample: true
-val_n: 1
-val_temperature: 0.7
-val_top_p: 0.8
-val_top_k: 20
+val_n: 4
+val_temperature: 1.0
+val_top_p: 1.0
+val_top_k: -1
 val_batch_size: 16
 save_eval_generations: false
 

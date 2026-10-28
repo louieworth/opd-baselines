@@ -23,5 +23,12 @@ __pycache__/
 /wandb/
 /tmp/
 tests
+# Keep the regression suites for ADOPD and shared training behavior reviewable.
+!/tests/
+/tests/*
+!/tests/test_adopd.py
+!/tests/test_training_alignment.py
+!/tests/test_opd_response_mask.py
+!/tests/test_opd_divergence.py
 *.log
 .DS_Store

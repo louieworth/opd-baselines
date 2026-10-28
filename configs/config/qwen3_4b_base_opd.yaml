@@ -3,13 +3,13 @@ model_path: Qwen/Qwen3-4B-Base
 auto_prepare_model: true
 local_models_only: true  # Use pre-downloaded HF snapshots; no network in SLURM.
 
-project_name: opd
+project_name: null
 experiment_name: qwen3_4b_base_opd_teacher_8b
 output_dir: /scratch/l/luli/results/onestep
 use_wandb: true
 wandb_mode: offline
 # Sync offline runs to this entity after the SLURM job finishes.
-wandb_entity: li-jiang-opd
+wandb_entity: null
 
 # 8 GPUs x 32 prompts x 1 response = 256 samples per update.
 # User-selected 256 prompts x 1; independent of Lightning standard OPD's 64 x 4.
