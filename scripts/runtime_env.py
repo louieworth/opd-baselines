@@ -25,7 +25,8 @@ def load_runtime_env() -> dict[str, str]:
 def configure_wandb_paths(env: dict[str, str], run_dir: Path, use_wandb: bool) -> None:
     # The SDK appends wandb/ to WANDB_DIR; use the repository as its root.
     env["WANDB_DIR"] = str(WANDB_ROOT.parent)
-    env["WANDB_USE_DOT_WANDB"] = "false"
+    # Without ./.wandb the SDK already picks wandb/; wandb 0.24 crashes in init if this is set.
+    env.pop("WANDB_USE_DOT_WANDB", None)
     env["WANDB_DATA_DIR"] = str(WANDB_ROOT / "staging")
     env["WANDB_CACHE_DIR"] = str(WANDB_ROOT / "cache")
     env["WANDB_ARTIFACT_DIR"] = str(WANDB_ROOT / "artifacts")

@@ -21,6 +21,7 @@ from src.adopd_options import runtime_options as adopd_runtime_options
 from src.adopd_trainer import AdopdTrainerMixin
 
 ROOT = Path(__file__).resolve().parents[1]
+DRIVER_NETWORK_ENV = ("WANDB_API_KEY", "WANDB_HTTPS_PROXY", "WANDB_HTTP_PROXY", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")
 
 
 class BaselineTrainer(RayPPOTrainer):
@@ -138,7 +139,14 @@ class AdopdTrainer(AdopdTrainerMixin, BaselineTrainer):
 def main(config):
     auto_set_device(config)
     config = migrate_legacy_reward_impl(config)
-    main_ppo.run_ppo(config, task_runner_class=ray.remote(num_cpus=1)(BaselineTaskRunner))
+    # Optionally pin the driver (W&B, metrics, dataloader state) to a node-local custom resource.
+    resource = os.environ.get("OPD_DRIVER_RESOURCE")
+    resources = {resource: 0.01} if resource else None
+    # Only the driver talks to W&B. Its credentials, proxy, and CA travel via the actor's runtime_env,
+    # never through the Hydra config, which is uploaded to W&B as the run config.
+    network = {name: os.environ[name] for name in DRIVER_NETWORK_ENV if os.environ.get(name)}
+    task_runner = ray.remote(num_cpus=1, resources=resources, runtime_env={"env_vars": network})
+    main_ppo.run_ppo(config, task_runner_class=task_runner(BaselineTaskRunner))
 
 
 if __name__ == "__main__":

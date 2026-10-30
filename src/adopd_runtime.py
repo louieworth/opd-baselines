@@ -131,6 +131,9 @@ sampled_answer_loss = answer_loss
 
 
 def install():
+    # Every Ray worker runs this hook, including the vLLM server actors (also for eval-only runs).
+    from src.vllm_ports import install as pin_vllm_ports
+    pin_vllm_ports()
     if not runtime_options().get('enabled', False):
         return
     if runtime_options().get('opd_loss_token_mode') == 'full_vocab':
