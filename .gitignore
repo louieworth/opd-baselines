@@ -31,5 +31,6 @@ tests
 !/tests/test_training_alignment.py
 !/tests/test_opd_response_mask.py
 !/tests/test_opd_divergence.py
+!/tests/test_gpqa_subsets.py
 *.log
 .DS_Store

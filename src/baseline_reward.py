@@ -87,7 +87,7 @@ def compute_score(
         return {"score": score, "acc": score, "formatted": float(extract_last_boxed(solution_str) is not None)}
     predicted = extract_last_boxed(solution_str)
     formatted = float(predicted is not None)
-    if data_source in {"mmlu", "mmlu_college_chemistry", "mmlu_college_medicine", "gpqa_diamond"}:
+    if data_source in {"mmlu", "mmlu_college_chemistry", "mmlu_college_medicine"} or data_source.startswith("gpqa"):
         selected = choice_letter(predicted) if predicted is not None else None
         score = float(selected is not None and selected == str(ground_truth).strip().upper())
         return {"score": score, "acc": score, "formatted": formatted}

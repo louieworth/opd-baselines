@@ -39,9 +39,14 @@ MMLU_SUBSETS = {
     "mmlu_college_chemistry": "college_chemistry",
     "mmlu_college_medicine": "college_medicine",
 }
+# GPQA Diamond subdomains evaluated as their own benchmarks.
+GPQA_SUBSETS = {
+    "gpqa_chemistry_general": "Chemistry (general)",
+    "gpqa_physics_general": "Physics (general)",
+}
 EXPECTED_EVAL_ROWS = {
     "mmlu": 14042, "mmlu_college_chemistry": 100, "mmlu_college_medicine": 173,
-    "gpqa_diamond": 198, "amc23": 40, "math500": 500, "gsm8k": 1319,
+    "gpqa_diamond": 198, "gpqa_chemistry_general": 20, "gpqa_physics_general": 19, "amc23": 40, "math500": 500, "gsm8k": 1319,
 }
 GPQA_SHUFFLE_SEED = 42
 CHOICE_SUFFIX = (
@@ -89,13 +94,16 @@ def convert_eval(name: str, rows: list[dict]) -> list[dict]:
             answer = "ABCD"[gold_index]
             qid = f"{row['subject']}/{i}"
             ability = "general"
-        elif name == "gpqa_diamond":
+        elif name == "gpqa_diamond" or name in GPQA_SUBSETS:
             question = row["Question"].strip()
             choices = [row["Correct Answer"].strip()] + [
                 row[f"Incorrect Answer {j}"].strip() for j in range(1, 4)
             ]
             order = list(range(4))
             rng.shuffle(order)
+            # Filter after shuffling so each subset question keeps its gpqa_diamond choice order.
+            if name in GPQA_SUBSETS and row["Subdomain"] != GPQA_SUBSETS[name]:
+                continue
             prompt = choice_prompt(question, [choices[j] for j in order])
             answer = "ABCD"[order.index(0)]
             qid = row.get("Record ID", i)
@@ -124,7 +132,7 @@ def convert_eval(name: str, rows: list[dict]) -> list[dict]:
 
 
 def read_eval_rows(name: str, raw: Path) -> list[dict]:
-    if name == "gpqa_diamond":
+    if name == "gpqa_diamond" or name in GPQA_SUBSETS:
         # Read only the Diamond member; do not extract other benchmark splits.
         with zipfile.ZipFile(raw) as archive:
             members = [p for p in archive.namelist() if Path(p).name == "gpqa_diamond.csv"]
@@ -142,13 +150,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rebuild", action="store_true", help="rebuild from pinned public sources")
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data", help="absolute dataset output root")
     parser.add_argument("--eval-only", action="store_true", help="prepare evaluation files without rebuilding training data")
-    parser.add_argument("--eval-datasets", nargs="+", choices=list(SOURCES) + list(MMLU_SUBSETS), default=list(SOURCES))
+    parser.add_argument("--eval-datasets", nargs="+", choices=list(SOURCES) + list(MMLU_SUBSETS) + list(GPQA_SUBSETS), default=list(SOURCES))
     args = parser.parse_args(argv)
     if not args.data_dir.is_absolute():
         parser.error("--data-dir must be an absolute path")
     eval_rebuilt = False
     for name in args.eval_datasets:
-        source_name = "mmlu" if name in MMLU_SUBSETS else name
+        source_name = "mmlu" if name in MMLU_SUBSETS else "gpqa_diamond" if name in GPQA_SUBSETS else name
         repo, revision, filename = SOURCES[source_name]
         out = args.data_dir / "eval" / f"{name}.parquet"
         if out.is_file() and not args.rebuild:
@@ -158,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
         raw.parent.mkdir(parents=True, exist_ok=True)
         url = (
             f"https://raw.githubusercontent.com/{repo}/{revision}/{filename}"
-            if name == "gpqa_diamond"
+            if source_name == "gpqa_diamond"
             else f"https://huggingface.co/datasets/{repo}/resolve/{revision}/{filename}"
         )
         if not raw.exists():
@@ -180,18 +188,19 @@ def main(argv: list[str] | None = None) -> int:
                   "raw_sha256": hashlib.sha256(raw.read_bytes()).hexdigest()}
         if name in MMLU_SUBSETS:
             source["subset"] = MMLU_SUBSETS[name]
-        if name == "gpqa_diamond":
-            source.update({"subset": "gpqa_diamond", "shuffle_seed": GPQA_SHUFFLE_SEED})
+        if source_name == "gpqa_diamond":
+            source.update({"subset": GPQA_SUBSETS.get(name, "gpqa_diamond"), "shuffle_seed": GPQA_SHUFFLE_SEED})
         out.with_suffix(".source.json").write_text(json.dumps(source, indent=2) + "\n", encoding="utf-8")
         print(f"Wrote {out} ({len(converted):,} rows)")
         eval_rebuilt = True
     if args.eval_only:
         return 0
-    train = args.data_dir / "train/dapo_math_17k.parquet"
-    if args.rebuild or eval_rebuilt or not train.is_file():
-        build(fetch_source(args.data_dir / "raw/thunlp_opd"), train)
-    else:
-        print(f"Using {train}")
+    for name, english_only in (("dapo_math_17k", False), ("dapo_math_17k_en", True)):
+        train = args.data_dir / f"train/{name}.parquet"
+        if args.rebuild or eval_rebuilt or not train.is_file():
+            build(fetch_source(args.data_dir / "raw/thunlp_opd"), train, english_only)
+        else:
+            print(f"Using {train}")
     return 0
 
 
