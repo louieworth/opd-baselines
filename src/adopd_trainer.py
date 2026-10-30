@@ -1,16 +1,33 @@
 """Driver-side ADOPD mixin; all group statistics are fixed before DP sharding."""
 
 import json
+from itertools import product
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from src.adopd_cache import TraceCache, halt_id
 from src.adopd_math import group_advantages, masked_sequence_mean, sampled_distortion
 from src.adopd_options import runtime_options
+from src.eval_metrics import compute_eval_metrics
 
 
 class AdopdTrainerMixin:
+    def _validate(self, *args, **kwargs):
+        mode = runtime_options().get('adopd_eval_plain_prompt', True)
+        self._adopd_eval_plain = mode is True or (mode == 'initial' and self.global_steps == 0)
+        try:
+            return super()._validate(*args, **kwargs)
+        finally:
+            del self._adopd_eval_plain
+
+    def _get_gen_batch(self, batch):
+        gen = super()._get_gen_batch(batch)
+        if hasattr(self, '_adopd_eval_plain'):  # validation rows only; training rows never carry it
+            gen.non_tensor_batch['adopd_eval_plain'] = np.full(len(gen), self._adopd_eval_plain, dtype=object)
+        return gen
+
     def init_workers(self):
         opts = runtime_options()
         actor, rollout = self.config.actor_rollout_ref.actor, self.config.actor_rollout_ref.rollout
@@ -106,12 +123,23 @@ class AdopdTrainerMixin:
         return output
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
-        metrics = super()._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        # verl measures the returned, training-sized response; the length that was scored is the full rollout.
+        full = dict(reward_extra_infos_dict, response_length=reward_extra_infos_dict['full_response_length'])
+        metrics = super()._val_metrics_update(data_sources, sample_uids, full, sample_turns)
+        # The rollout without the budget instruction, when run, is scored exactly like the budgeted one.
+        prefixes = ('', 'nobudget_') if 'nobudget_acc' in reward_extra_infos_dict else ('',)
+        if 'nobudget_acc' in reward_extra_infos_dict:
+            plain = compute_eval_metrics(data_sources, sample_uids, reward_extra_infos_dict['nobudget_acc'],
+                k=self.config.actor_rollout_ref.rollout.val_kwargs.n,
+                response_lengths=reward_extra_infos_dict['nobudget_response_length'])
+            metrics.update({key.replace('eval/', 'eval_nobudget/', 1): value for key, value in plain.items()})
         for source in set(data_sources):
             indices = [i for i, value in enumerate(data_sources) if value == source]
-            for field in ('reasoning_length', 'answer_length', 'forced_halt'):
-                values = reward_extra_infos_dict[field]
-                metrics[f'eval/{source}/{field}'] = sum(float(values[i]) for i in indices) / len(indices)
+            for prefix, field in product(prefixes,
+                                         ('reasoning_length', 'answer_length', 'finished', 'over_budget')):
+                values = reward_extra_infos_dict[prefix + field]
+                group = 'eval_nobudget' if prefix else 'eval'
+                metrics[f'{group}/{source}/{field}'] = sum(float(values[i]) for i in indices) / len(indices)
         path = Path(self.config.trainer.default_local_dir) / 'eval_metrics'
         path.mkdir(parents=True, exist_ok=True)
         (path / f'{self.global_steps}.json').write_text(json.dumps(metrics, indent=2) + '\n')

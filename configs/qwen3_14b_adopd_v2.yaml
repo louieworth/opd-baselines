@@ -1,0 +1,90 @@
+# Frozen initial Qwen3-14B reference traces; ANSWER-only KL with selectable estimator.
+method: adopd
+model_path: /opt/tiger/models/Qwen3-14B
+teacher_model_path: /opt/tiger/models/Qwen3-14B
+auto_prepare_model: false
+local_models_only: true
+mode: thinking
+adopd_use_group_rollouts: false # false: single-rollout length PG; true: group Eq. (5)/(6)
+group_size: 8
+adopd_reasoning_budget: 8192 # controls both the student budget prompt and hard cutoff
+adopd_teacher_max_completion_length: 16384
+adopd_length_penalty: 0.1 # active in both modes; 0 disables the single-rollout length PG
+adopd_teacher_trace_cache: /opt/tiger/opd-baselines/data/.cache/adopd_v2 # head-local; read by the driver only
+adopd_cache_seed: 42
+adopd_cache_batch_size: 64 # prompts per replica request; ~fills one H100 KV cache at 16k tokens
+max_completion_length: 16384 # reasoning + forced halt (if any) + answer
+project_name: efficient-reasoning
+experiment_name: qwen3_14b_adopd_v2
+output_dir: /opt/tiger/opd-baselines/outputs/adopd-v2 # node-local; each node keeps its own FSDP shards
+use_wandb: true
+wandb_mode: online
+wandb_entity: li-jiang-research
+h100_nnodes: 2
+n_gpus_per_node: 8
+vllm_tensor_parallel_size: 2
+# 16 trajectories/GPU/update: 2x8 GPUs => 256 prompts x 1 (or 32 x 8 with groups).
+per_device_batch_size: 16
+ppo_mini_batch_size: null # one complete rollout batch, derived from the GPU count
+actor_use_dynamic_bsz: false
+ppo_micro_batch_size_per_gpu: 1
+actor_max_token_len_per_gpu: 18432
+num_epochs: 1
+total_training_steps: null
+learning_rate: 1.0e-6
+warmup_steps: 25
+weight_decay: 0.01
+max_grad_norm: 1.0
+kl_loss_coef: 0.0
+max_train_samples: 100000
+max_prompt_length: 2048
+temperature: 1.0
+top_p: 1.0
+top_k_sampling: -1
+vllm_gpu_memory_utilization: 0.45
+teacher_enable_resource_pool: false
+teacher_n_gpus_per_node: 8
+teacher_tp_size: 2 # training replicas; the offline cache can use teacher_tp_size=1
+teacher_gpu_memory_utilization: 0.3
+distillation_num_workers: 8
+distillation_loss_mode: k1 # native registration; actual answer loss is selected below
+distillation_use_task_rewards: false
+opd_loss_token_mode: sample # sample or full_vocab; both supervise only answer positions
+opd_distribution_chunk_size: 32 # answer positions per full-vocabulary reconstruction chunk
+opd_enable_metrics: false
+train_files: /opt/tiger/opd-baselines/data/train/dapo_math_17k_en.parquet
+val_files:
+- /opt/tiger/opd-baselines/data/eval/aime25.parquet
+- /opt/tiger/opd-baselines/data/eval/aime26.parquet
+- /opt/tiger/opd-baselines/data/eval/hmmt26.parquet
+- /opt/tiger/opd-baselines/data/eval/amc23.parquet
+- /opt/tiger/opd-baselines/data/eval/gpqa_chemistry_general.parquet
+- /opt/tiger/opd-baselines/data/eval/gpqa_physics_general.parquet
+val_before_train: true
+eval_steps: 20
+val_max_prompt_length: 4096
+val_max_completion_length: 32768 # eval only; training stays at 16384
+val_do_sample: true
+val_n: 8
+val_temperature: 1.0
+val_top_p: 1.0
+val_top_k: -1
+val_batch_size: 200 # the whole eval set in one batch keeps the GPUs busy
+save_eval_generations: false
+save_steps: 20 # ~56 GB per checkpoint on HDFS: saves at 20, 40 and the final step
+max_checkpoints_to_keep: 1
+checkpoint_save_contents: [model, optimizer, extra, hf_model]
+h100_runtime:
+  student:
+    enforce_eager: false # CUDA graphs; needs VLLM_ATTENTION_BACKEND=FLASH_ATTN in this image
+    enable_chunked_prefill: true
+    max_num_batched_tokens: 4096
+    max_num_seqs: 128
+  teacher:
+    enforce_eager: true
+    enable_chunked_prefill: true
+    max_num_batched_tokens: 4096
+    max_num_seqs: 128
+# Budget prompt at every eval; the plain prompt (= base model) only at step 0, i.e. only runs
+# with val_before_train.
+adopd_eval_plain_prompt: initial

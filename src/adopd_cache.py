@@ -5,8 +5,12 @@ import json
 import os
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
+
+# Shared (network) cache storage has high per-file latency; overlap that many file operations.
+IO_THREADS = 64
 
 
 def digest(value):
@@ -106,13 +110,13 @@ def validate_training_cache(config):
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(config['teacher_model_path'], local_files_only=True)
     cache = TraceCache(config['adopd_teacher_trace_cache'], cache_identity(config))
-    count = 0
-    for prompt in training_prompts(config, tokenizer):
-        cache.read(prompt, halt_id(tokenizer))
-        count += 1
-    if not count:
+    stop = halt_id(tokenizer)
+    prompts = list(training_prompts(config, tokenizer))
+    if not prompts:
         raise ValueError('No valid training prompts for ADOPD')
-    return count
+    with ThreadPoolExecutor(max_workers=IO_THREADS) as pool:
+        list(pool.map(lambda prompt: cache.read(prompt, stop), prompts))
+    return len(prompts)
 
 
 def prepare(config, dry_run=False):
@@ -120,13 +124,19 @@ def prepare(config, dry_run=False):
     tokenizer = AutoTokenizer.from_pretrained(config['teacher_model_path'], local_files_only=True)
     stop = halt_id(tokenizer)
     cache = TraceCache(config['adopd_teacher_trace_cache'], cache_identity(config))
-    missing, reused = [], 0
-    for prompt in training_prompts(config, tokenizer):
+
+    def cached(prompt):
         try:
             cache.read(prompt, stop)
-            reused += 1
+            return True
         except FileNotFoundError:
-            missing.append(prompt)
+            return False
+
+    prompts = list(training_prompts(config, tokenizer))
+    with ThreadPoolExecutor(max_workers=IO_THREADS) as pool:
+        found = list(pool.map(cached, prompts))
+    missing = [prompt for prompt, hit in zip(prompts, found) if not hit]
+    reused = sum(found)
     print(json.dumps(dict(teacher_cache=str(cache.root), reused=reused, missing=len(missing), dry_run=dry_run)), flush=True)
     if dry_run or not missing:
         return
@@ -142,12 +152,25 @@ def prepare(config, dry_run=False):
         try:
             while pending:
                 prompts = [pending.popleft() for _ in range(min(len(pending), config['adopd_cache_batch_size']))]
-                worker.generate(prompts)
+                store(worker.cache, prompts, worker.generate(prompts), worker.stop)
                 print(f'Teacher cache: {reused + len(missing) - len(pending)}/{reused + len(missing)}', flush=True)
         finally:
             worker.close()
         return
     prepare_distributed(config, missing, reused)
+
+
+def store(cache, prompts, traces, halt_token_id):
+    """Write one generated batch; each entry is its own file, so write them concurrently for slow storage."""
+    if len(prompts) != len(traces):
+        raise RuntimeError(f'Teacher returned {len(traces)} traces for {len(prompts)} prompts')
+
+    def write(prompt, result):
+        trace, forced = result
+        cache.write(prompt, trace, halt_token_id, forced)
+
+    with ThreadPoolExecutor(max_workers=IO_THREADS) as pool:
+        list(pool.map(write, prompts, traces))
 
 
 class TeacherCacheWorker:
@@ -179,7 +202,8 @@ class TeacherCacheWorker:
                   stop_token_ids=[stop], seed=(config['adopd_cache_seed'] + int(digest(p)[:8], 16)) % (2**31))
                   for p in prompts]
         outputs = self.llm.generate([dict(prompt_token_ids=p) for p in prompts], params, use_tqdm=False)
-        for prompt, output in zip(prompts, outputs, strict=True):
+
+        def closed(output):
             trace = list(output.outputs[0].token_ids)
             forced = stop not in trace
             if not forced:
@@ -189,8 +213,10 @@ class TeacherCacheWorker:
                 if trace and trace[-1] in eos:
                     trace.pop()
                 trace = trace[:budget - 1] + [stop]
-            self.cache.write(prompt, trace, stop, forced)
-        return len(prompts)
+            return trace, forced
+
+        # Returned, not written: a replica on another node cannot reach the driver's node-local cache.
+        return [closed(output) for output in outputs]
 
     def close(self):
         # Shut down the engine (and its CUDA subprocesses) before training starts.
@@ -216,6 +242,7 @@ def cache_worker_layout(config, nodes):
 
 def prepare_distributed(config, missing, reused):
     import ray
+    from transformers import AutoTokenizer
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
     # Attach to the allocation's Ray cluster, rather than creating a head-only
@@ -227,6 +254,9 @@ def prepare_distributed(config, missing, reused):
         # must see only their assigned GPU group.
         'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES': '0',
     }})
+    # The driver's node holds the cache; every replica's traces are written here.
+    cache = TraceCache(config['adopd_teacher_trace_cache'], cache_identity(config))
+    stop = halt_id(AutoTokenizer.from_pretrained(config['teacher_model_path'], local_files_only=True))
     workers, active = [], {}
     initialized, succeeded = False, False
     total, pending = reused + len(missing), deque(missing)
@@ -250,17 +280,18 @@ def prepare_distributed(config, missing, reused):
                     break
                 prompts = [pending.popleft() for _ in range(min(len(pending), config['adopd_cache_batch_size']))]
                 future = worker.generate.remote(prompts)
-                active[future] = (worker, len(prompts))
+                active[future] = (worker, prompts)
                 idle.remove(worker)
             if active:
                 ready, _ = ray.wait(list(active), num_returns=1, timeout=5)
                 for future in ready:
-                    worker, _ = active[future]
-                    ray.get(future)  # Fail the preparation stage on a generation error.
+                    worker, prompts = active[future]
+                    # Fails the preparation stage on a generation error.
+                    store(cache, prompts, ray.get(future), stop)
                     del active[future]
                     idle.append(worker)
             if time.monotonic() - last_report >= 30 or not (pending or active):
-                completed = total - len(pending) - sum(count for _, count in active.values())
+                completed = total - len(pending) - sum(len(prompts) for _, prompts in active.values())
                 print(f'Teacher cache: {completed}/{total} '
                       f'(active replicas={len(active)}, pending={len(pending)})', flush=True)
                 last_report = time.monotonic()

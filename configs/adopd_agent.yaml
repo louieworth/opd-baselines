@@ -1,2 +1,4 @@
 - name: adopd_agent
   _target_: src.adopd_rollout.AdopdAgentLoop
+- name: adopd_eval_agent
+  _target_: src.adopd_rollout.AdopdEvalAgentLoop

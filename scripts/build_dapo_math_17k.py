@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import urllib.request
 from pathlib import Path
 
@@ -22,6 +23,9 @@ SOURCE_SUFFIX = " Please reason step by step, and put your final answer within \
 NORMALIZED_SUFFIX = " Please reason step by step, and put your final answer within \\boxed{}."
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = Path("data/train/dapo_math_17k.parquet")
+ENGLISH_OUT = Path("data/train/dapo_math_17k_en.parquet")
+# The pinned release mixes English and Chinese questions; English training drops any CJK question.
+CJK = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯＀-￯]")
 
 
 def convert_rows(rows: list[dict]) -> list[dict]:
@@ -64,16 +68,18 @@ def fetch_source(cache_dir: Path) -> Path:
     return target
 
 
-def build(source: Path, output: Path) -> Path:
+def build(source: Path, output: Path, english_only: bool = False) -> Path:
     rows = pq.read_table(source).to_pylist()
     converted = convert_rows(rows)
     normalize = lambda text: "".join(text.casefold().split())
     heldout = set()
-    eval_files = [ROOT / f"data/eval/{name}.parquet" for name in ("aime25", "aime26", "hmmt26", "amobench")]
+    eval_files = [ROOT / f"data/eval/{name}.parquet" for name in ("aime25", "aime26", "hmmt26", "amobench", "amc23")]
     for path in eval_files:
         if path.is_file():
             heldout.update(normalize(row["extra_info"]["problem"]) for row in pq.read_table(path).to_pylist())
     converted = [row for row in converted if normalize(row["extra_info"]["problem"]) not in heldout]
+    if english_only:
+        converted = [row for row in converted if not CJK.search(row["extra_info"]["problem"])]
 
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(".parquet.tmp")
@@ -87,11 +93,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, help="local source parquet; skips download")
     parser.add_argument("--cache-dir", type=Path, default=Path("data/raw/thunlp_opd"))
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--english-only", action="store_true", help="drop questions containing CJK text")
     args = parser.parse_args()
     os.chdir(ROOT)
     source = args.source if args.source else fetch_source(args.cache_dir)
-    build(source, args.out)
+    build(source, args.out or (ENGLISH_OUT if args.english_only else DEFAULT_OUT), args.english_only)
     return 0
 
 

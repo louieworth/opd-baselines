@@ -36,6 +36,13 @@ ROOT = Path(__file__).resolve().parents[1]
 METHODS = {"grpo", "opd", "adopd"}
 PROMPT_MODES = {"thinking", "non-thinking", "plaint"}
 QWEN3_BASE_STUDENTS = {"Qwen/Qwen3-4B-Base", "Qwen/Qwen3-1.7B-Base"}
+RAY_FORWARDED_ENV = {
+    "PYTHONPATH", "HYDRA_FULL_ERROR", "TOKENIZERS_PARALLELISM", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS", "PYTHONUNBUFFERED",
+    "OPD_DRIVER_RESOURCE", "NCCL_DEBUG", "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+}
+RAY_FORWARDED_ENV_PREFIXES = ("HF_", "WANDB_", "VLLM_")
+RAY_PRIVATE_ENV = {"WANDB_API_KEY", "WANDB_HTTPS_PROXY", "WANDB_HTTP_PROXY", "HF_TOKEN"}
 BASE_CONFIG_RENAMES = {
     "qwen3_1_7b_opd.yaml": "qwen3_1_7b_base_opd.yaml",
     "qwen3_4b_opd.yaml": "qwen3_4b_base_opd.yaml",
@@ -148,9 +155,10 @@ def load_config(path: Path) -> dict[str, Any]:
     unknown = sorted(set(payload) - ALLOWED_KEYS)
     if unknown:
         raise ValueError(f"{path}: unsupported keys: {unknown}")
-    if payload.get("wandb_mode", "offline") != "offline":
-        raise ValueError(f"{path}: training requires wandb_mode: offline; sync after the job finishes")
-    payload["wandb_mode"] = "offline"
+    # Offline suits compute nodes without internet (sync afterwards); online needs a reachable W&B.
+    payload["wandb_mode"] = payload.get("wandb_mode", "offline")
+    if payload["wandb_mode"] not in {"offline", "online"}:
+        raise ValueError(f"{path}: wandb_mode must be offline or online")
     entity = payload.get("wandb_entity")
     if entity is not None:
         if not isinstance(entity, str):
@@ -422,7 +430,8 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
     max_response = positive_int(cfg, "max_completion_length", 8192)
     val_max_prompt = positive_int(cfg, "val_max_prompt_length", max_prompt)
     val_max_response = positive_int(cfg, "val_max_completion_length", max_response)
-    if val_max_response != max_response:
+    # ADOPD evaluation generates up to its own limit and returns a training-sized response to verl.
+    if val_max_response != max_response and not (adopd and val_max_response > max_response):
         raise ValueError("This native verl rollout requires equal train and validation response lengths")
     train_max_seq = max_prompt + max_response
     rollout_prompt_length = max(max_prompt, val_max_prompt)
@@ -434,7 +443,7 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
     train_files = data_references(cfg["train_files"])
     val_files = data_references(cfg["val_files"])
     model_path = effective_model(cfg)
-    reward_path = "src/reward_async.py"
+    reward_path = ROOT / "src/reward_async.py"
     kl_coef = float(cfg.get("kl_loss_coef", 0.0))
     use_kl = kl_coef != 0.0
     use_wandb = strict_bool(cfg, "use_wandb", True)
@@ -558,7 +567,7 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
                 override("data.custom_cls.path", "pkg://src.plaint_runtime"),
                 override("data.custom_cls.name", "PlaintDataset"),
                 override("actor_rollout_ref.rollout.agent.default_agent_loop", "plaint_agent"),
-                override("actor_rollout_ref.rollout.agent.agent_loop_config_path", "configs/plaint_agent.yaml"),
+                override("actor_rollout_ref.rollout.agent.agent_loop_config_path", ROOT / "configs/plaint_agent.yaml"),
             ]
         )
     else:
@@ -633,7 +642,7 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
     if adopd:
         extension = adopd_options(cfg)
         extension.update(enabled=not eval_only, eval_only=eval_only, group_size=cfg['group_size'],
-                         max_completion_length=max_response,
+                         max_completion_length=max_response, eval_max_completion_length=val_max_response,
                          objective=adopd_objective_name(cfg), h100_runtime=bool(cfg.get('h100_runtime')))
         feature_options = {}
         if not eval_only:
@@ -647,7 +656,9 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
             override('data.custom_cls.name', 'AdopdDataset'),
             override('+data.adopd_reasoning_budget', cfg['adopd_reasoning_budget']),
             override('actor_rollout_ref.rollout.agent.default_agent_loop', 'adopd_agent'),
-            override('actor_rollout_ref.rollout.agent.agent_loop_config_path', 'configs/adopd_agent.yaml'),
+            # Validation never forces a halt; it scores rollouts with and without the budget prompt.
+            override('+data.val_agent_name', 'adopd_eval_agent'),
+            override('actor_rollout_ref.rollout.agent.agent_loop_config_path', ROOT / 'configs/adopd_agent.yaml'),
             override('actor_rollout_ref.actor.ppo_epochs', 1),
             override('algorithm.rollout_correction', None),
             override('++ray_kwargs.ray_init.runtime_env.env_vars.ADOPD_CONFIG',
@@ -857,9 +868,8 @@ def main(argv: list[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=args.resume is not None)
     (run_dir / "training_finished.json").unlink(missing_ok=True)
     (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
-    (run_dir / "launch_command.txt").write_text(shlex.join(command) + "\n", encoding="utf-8")
 
-    # SLURM training only records local W&B data, even if online mode was exported.
+    # The recipe's wandb_mode wins over an exported WANDB_MODE.
     env["WANDB_MODE"] = cfg["wandb_mode"]
     if strict_bool(cfg, "local_models_only", False):
         env["HF_HUB_OFFLINE"] = "1"
@@ -889,6 +899,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         env.pop('ADOPD_CONFIG', None)
     configure_wandb_paths(env, run_dir, strict_bool(cfg, "use_wandb", True))
+    # A long-lived Ray cluster started its raylets without this launcher's
+    # environment; send it to every worker explicitly. Credentials stay out of
+    # the Hydra command and the saved launch command.
+    for name in sorted(env):
+        if name in RAY_FORWARDED_ENV or name.startswith(RAY_FORWARDED_ENV_PREFIXES):
+            if name not in RAY_PRIVATE_ENV and env[name]:
+                command.append(override(f"++ray_kwargs.ray_init.runtime_env.env_vars.{name}", json.dumps(env[name])))
+    (run_dir / "launch_command.txt").write_text(shlex.join(command) + "\n", encoding="utf-8")
 
     return_code = run_training(command, run_dir, env, keep)
     (run_dir / "training_finished.json").write_text(

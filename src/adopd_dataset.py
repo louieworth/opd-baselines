@@ -23,3 +23,10 @@ class AdopdDataset(RLHFDataset):
             desc=f'Filtering budget-conditioned prompts longer than {limit} tokens')
         print(f'filter dataset len: {len(dataframe)}')
         return dataframe
+
+    def __getitem__(self, item):
+        row = super().__getitem__(item)
+        if self.config.get('agent_name'):
+            # verl runs each row with its own agent loop; validation selects the unforced evaluator.
+            row['agent_name'] = self.config['agent_name']
+        return row

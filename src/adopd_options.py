@@ -14,6 +14,7 @@ DEFAULTS = {
     'adopd_teacher_trace_cache': str(ROOT / 'data/.cache/adopd_v2'),
     'adopd_cache_seed': 42,
     'adopd_cache_batch_size': 16,
+    'adopd_eval_plain_prompt': True,  # True, False, or 'initial' (only the step-0 evaluation)
 }
 KEYS = tuple(DEFAULTS)
 LOSS_KEYS = ('opd_loss_token_mode', 'opd_distribution_chunk_size')
@@ -29,6 +30,8 @@ def options(config):
         raise ValueError('opd_distribution_chunk_size must be a positive integer')
     if type(result['adopd_use_group_rollouts']) is not bool:
         raise ValueError('adopd_use_group_rollouts must be a boolean')
+    if type(result['adopd_eval_plain_prompt']) is not bool and result['adopd_eval_plain_prompt'] != 'initial':
+        raise ValueError("adopd_eval_plain_prompt must be a boolean or 'initial'")
     for key in ('adopd_reasoning_budget', 'adopd_teacher_max_completion_length', 'adopd_cache_batch_size'):
         if type(result[key]) is not int or result[key] < 1:
             raise ValueError(f'{key} must be a positive integer')

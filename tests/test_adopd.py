@@ -30,6 +30,53 @@ def recipe():
     return run_baseline.load_config(ROOT / 'configs/qwen3_4b_adopd_v2.yaml')
 
 
+@pytest.mark.parametrize('mode', ['offline', 'online'])
+def test_recipe_accepts_offline_or_online_wandb(tmp_path, mode):
+    import yaml
+    path = tmp_path / 'recipe.yaml'
+    path.write_text(yaml.safe_dump({**recipe(), 'wandb_mode': mode}))
+    assert run_baseline.load_config(path)['wandb_mode'] == mode
+    path.write_text(yaml.safe_dump({**recipe(), 'wandb_mode': 'sometimes'}))
+    with pytest.raises(ValueError, match='wandb_mode'):
+        run_baseline.load_config(path)
+
+
+def test_colocated_vllm_engines_get_disjoint_ports_below_ephemeral_range():
+    from src.vllm_ports import PORTS_PER_ENGINE, engine_port
+    names = [f'vllm_server_{kind}{replica}_0' for kind in ('', 'teacher_') for replica in range(16)]
+    starts = {engine_port(name) for name in names}
+    assert len(starts) == 32  # one range per student and per teacher replica
+    ranges = sorted((start, start + PORTS_PER_ENGINE) for start in starts)
+    assert all(a[1] <= b[0] for a, b in zip(ranges, ranges[1:]))
+    assert ranges[0][0] >= 1024 and ranges[-1][1] <= 32768  # Linux ephemeral ports start at 32768
+    assert engine_port('not_a_server') is None
+
+
+def test_vllm_server_launch_pins_its_port_range(monkeypatch):
+    import ray
+    from src import vllm_ports
+    class Server:
+        async def launch_server(self, *args):
+            return os.environ.get('VLLM_PORT')
+    monkeypatch.setitem(sys.modules, 'verl.workers.rollout.vllm_rollout.vllm_async_server',
+                        SimpleNamespace(vLLMHttpServer=Server))
+    monkeypatch.setattr(ray, 'get_runtime_context',
+                        lambda: SimpleNamespace(get_actor_name=lambda: 'vllm_server_teacher_3_0'))
+    monkeypatch.delenv('VLLM_PORT', raising=False)
+    vllm_ports.install()
+    assert asyncio.run(Server().launch_server()) == str(vllm_ports.engine_port('vllm_server_teacher_3_0'))
+    monkeypatch.delenv('VLLM_PORT', raising=False)
+
+
+def test_worker_loaded_files_resolve_outside_the_repository(tmp_path, monkeypatch):
+    # Ray workers on a long-lived cluster do not start in the repository.
+    monkeypatch.chdir(tmp_path)
+    native = compose(recipe(), tmp_path)
+    for value in (native.actor_rollout_ref.rollout.agent.agent_loop_config_path,
+                  native.reward.custom_reward_function.path):
+        assert Path(value).is_absolute() and Path(value).is_file()
+
+
 def compose(cfg, tmp_path, extra=()):
     command = run_baseline.build_command(cfg, tmp_path, list(extra))
     with hydra.initialize_config_dir(config_dir=str(ROOT / 'third_party/verl/verl/trainer/config'), version_base=None):
@@ -46,8 +93,9 @@ def test_recipe_native_config_and_workers(group, nnodes, mode, tmp_path):
     cfg['opd_loss_token_mode'] = mode
     native = compose(cfg, tmp_path)
     g = 8 if group else 1
-    trajectories = 16 * 4 * nnodes
-    assert native.trainer.nnodes == nnodes and native.trainer.n_gpus_per_node == 4
+    gpus = cfg['n_gpus_per_node']
+    trajectories = 16 * gpus * nnodes
+    assert native.trainer.nnodes == nnodes and native.trainer.n_gpus_per_node == gpus
     assert native.data.train_batch_size == trajectories // g
     assert native.actor_rollout_ref.actor.ppo_mini_batch_size == trajectories // g
     assert native.actor_rollout_ref.rollout.n == g
@@ -108,11 +156,19 @@ def test_eval_preserves_budget_without_teacher_or_cache(tmp_path, monkeypatch, m
 @pytest.mark.parametrize('key,value', [('adopd_use_group_rollouts', 'true'),
     ('adopd_reasoning_budget', 16383), ('adopd_length_penalty', -1),
     ('adopd_length_penalty', float('nan')), ('adopd_teacher_trace_cache', 'relative'),
-    ('adopd_cache_seed', True), ('adopd_cache_batch_size', 0),
+    ('adopd_cache_seed', True), ('adopd_cache_batch_size', 0), ('adopd_eval_plain_prompt', 'false'),
     ('opd_loss_token_mode', 'top_k_teacher'), ('opd_distribution_chunk_size', 0)])
 def test_invalid_options(key, value):
     with pytest.raises(ValueError):
         options({key: value})
+
+
+def test_eval_runs_the_plain_prompt_by_default():
+    assert options({})['adopd_eval_plain_prompt'] is True
+
+
+def test_plain_prompt_eval_can_be_limited_to_the_initial_evaluation():
+    assert options({'adopd_eval_plain_prompt': 'initial'})['adopd_eval_plain_prompt'] == 'initial'
 
 
 def test_sampled_kl_value_and_expected_gradient_match_exact_reverse_kl():
@@ -340,6 +396,145 @@ def test_student_agent_budget_prompt_and_original_teacher_metadata(monkeypatch, 
     assert calls[1]['prompt_ids'] == student + [4, 99]
     assert output.extra_fields['adopd_teacher_prompt_ids'] == teacher
     assert messages == original
+
+
+@pytest.mark.parametrize('budgeted,plain', [
+    ([4, 99, 7], [5, 6, 99, 7]),  # both rollouts close their traces and answer
+    ([4, 4, 4, 4], [5, 99, 8]),   # the budgeted rollout never closes: no answer, and no forced halt
+])
+def test_eval_agent_scores_unforced_rollouts_with_and_without_budget_prompt(monkeypatch, budget_tokenizer,
+                                                                             budgeted, plain):
+    import src.reward_async
+    from src.adopd_prompt import prompt_pair_ids
+    from src.adopd_rollout import eval_agent_class
+    monkeypatch.setenv('ADOPD_CONFIG', json.dumps(dict(adopd_reasoning_budget=2, enabled=True,
+                                                       eval_max_completion_length=6)))
+    messages = [{'role': 'user', 'content': 'q'}]
+    teacher, student = prompt_pair_ids(budget_tokenizer, messages, 2)
+    calls = []
+
+    async def generate(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(token_ids=budgeted if kwargs['prompt_ids'] == student else plain)
+
+    async def apply_template(messages):
+        return budget_tokenizer.apply_chat_template(messages)
+
+    async def score(source, text, truth):
+        return {'acc': float(text == truth)}
+
+    monkeypatch.setattr(src.reward_async, 'compute_score', score)
+    agent = object.__new__(eval_agent_class())
+    agent.tokenizer, agent.response_length = budget_tokenizer, 6
+    agent.apply_chat_template = apply_template
+    agent.server_manager = SimpleNamespace(generate=generate)
+    output = asyncio.run(agent.run({'temperature': 1.0}, raw_prompt=messages, adopd_eval_plain=True,
+        data_source='math', reward_model={'ground_truth': '7'}))
+    info = output.extra_fields['reward_extra_info']
+    assert output.prompt_ids == student and output.response_ids == budgeted and all(output.response_mask)
+    assert sorted(call['prompt_ids'] for call in calls) == sorted([student, teacher])
+    for call in calls:  # free generation: no halt stop, no blocked EOS, full response budget
+        assert call['sampling_params'] == {'temperature': 1.0, 'max_tokens': 6}
+    for prefix, tokens in (('', budgeted), ('nobudget_', plain)):
+        closed = 99 in tokens
+        stop = tokens.index(99) if closed else len(tokens)
+        assert info[prefix + 'acc'] == float(closed and tokens[stop + 1:] == [7])
+        assert info[prefix + 'finished'] == float(closed)
+        assert info[prefix + 'reasoning_length'] == stop
+        assert info[prefix + 'over_budget'] == float(stop > 2)
+    # verl records the evaluated response's length itself; a second copy breaks its validation lists.
+    assert 'response_length' not in info and info['nobudget_response_length'] == len(plain)
+
+
+def test_budget_only_eval_skips_the_plain_prompt_rollout(monkeypatch, budget_tokenizer):
+    import src.reward_async
+    from src.adopd_prompt import prompt_pair_ids
+    from src.adopd_rollout import eval_agent_class
+    monkeypatch.setenv('ADOPD_CONFIG', json.dumps(dict(adopd_reasoning_budget=2, enabled=True,
+                                                       eval_max_completion_length=6)))
+    messages = [{'role': 'user', 'content': 'q'}]
+    _, student = prompt_pair_ids(budget_tokenizer, messages, 2)
+    calls = []
+
+    async def generate(**kwargs):
+        calls.append(kwargs['prompt_ids'])
+        return SimpleNamespace(token_ids=[4, 99, 7])
+
+    async def apply_template(messages):
+        return budget_tokenizer.apply_chat_template(messages)
+
+    async def score(source, text, truth):
+        return {'acc': float(text == truth)}
+
+    monkeypatch.setattr(src.reward_async, 'compute_score', score)
+    agent = object.__new__(eval_agent_class())
+    agent.tokenizer, agent.response_length = budget_tokenizer, 6
+    agent.apply_chat_template = apply_template
+    agent.server_manager = SimpleNamespace(generate=generate)
+    output = asyncio.run(agent.run({'temperature': 1.0}, raw_prompt=messages, adopd_eval_plain=False,
+        data_source='math', reward_model={'ground_truth': '7'}))
+    info = output.extra_fields['reward_extra_info']
+    assert calls == [student] and output.response_ids == [4, 99, 7]
+    assert info['acc'] == 1. and info['reasoning_length'] == 1
+    assert not any(key.startswith('nobudget_') for key in info)
+
+
+def test_only_validation_rows_use_the_eval_agent(monkeypatch):
+    from src.eval_data import with_eval_prompt_limit
+    from src.adopd_dataset import AdopdDataset
+    from verl.utils.dataset.rl_dataset import RLHFDataset
+    seen = {}
+    def create(paths, data_config, tokenizer, processor, is_train=True, max_samples=-1):
+        dataset = object.__new__(AdopdDataset)
+        dataset.config = data_config
+        seen[is_train] = dataset
+    from omegaconf import OmegaConf
+    config = OmegaConf.create({'val_agent_name': 'adopd_eval_agent'})  # verl's struct-free data config
+    with_eval_prompt_limit(create)([], config, None, None, is_train=True)
+    with_eval_prompt_limit(create)([], config, None, None, is_train=False)
+    monkeypatch.setattr(RLHFDataset, '__getitem__', lambda self, item: {'index': item})
+    assert 'agent_name' not in seen[True][0]
+    assert seen[False][0]['agent_name'] == 'adopd_eval_agent'
+    assert config == {'val_agent_name': 'adopd_eval_agent'}
+
+
+def test_eval_reports_budget_and_no_budget_metrics_per_benchmark(tmp_path):
+    class Parent:
+        def _val_metrics_update(self, *args): return {'eval/aime25/avg@2': .5}
+    class Trainer(AdopdTrainerMixin, Parent): pass
+    trainer = Trainer()
+    trainer.config = SimpleNamespace(trainer=SimpleNamespace(default_local_dir=str(tmp_path)),
+        actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(val_kwargs=SimpleNamespace(n=2))))
+    trainer.global_steps = 3
+    fields = dict(reasoning_length=[2, 8, 4, 4], answer_length=[1, 2, 3, 3],
+                  finished=[1., 0., 1., 1.], over_budget=[0., 1., 0., 0.])
+    extras = {**fields, **{f'nobudget_{k}': v for k, v in fields.items()},
+              'nobudget_acc': [1., 0., 0., 0.], 'nobudget_response_length': [10, 20, 5, 5],
+              'full_response_length': [3, 10, 7, 7]}
+    metrics = trainer._val_metrics_update(['aime25'] * 2 + ['amc23'] * 2, ['a', 'a', 'b', 'b'], extras, [])
+    assert metrics['eval/aime25/avg@2'] == .5
+    assert metrics['eval/aime25/reasoning_length'] == 5 and metrics['eval/aime25/over_budget'] == .5
+    assert metrics['eval_nobudget/aime25/avg@2'] == .5 and metrics['eval_nobudget/aime25/pass@2'] == 1.
+    assert metrics['eval_nobudget/amc23/avg@2'] == 0.
+    assert metrics['eval_nobudget/aime25/response-length'] == 15
+    assert metrics['eval_nobudget/aime25/finished'] == .5
+    assert metrics['eval_nobudget/amc23/answer_length'] == 3
+    assert json.loads((tmp_path / 'eval_metrics/3.json').read_text()) == metrics
+
+
+def test_budget_only_eval_reports_only_budget_metrics(tmp_path):
+    class Parent:
+        def _val_metrics_update(self, *args): return {'eval/aime25/avg@2': .5}
+    class Trainer(AdopdTrainerMixin, Parent): pass
+    trainer = Trainer()
+    trainer.config = SimpleNamespace(trainer=SimpleNamespace(default_local_dir=str(tmp_path)),
+        actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(val_kwargs=SimpleNamespace(n=2))))
+    trainer.global_steps = 0
+    extras = dict(reasoning_length=[2, 8], answer_length=[1, 2], finished=[1., 0.], over_budget=[0., 1.],
+                  full_response_length=[3, 10])
+    metrics = trainer._val_metrics_update(['aime25'] * 2, ['a', 'a'], extras, [])
+    assert metrics == {'eval/aime25/avg@2': .5, 'eval/aime25/reasoning_length': 5, 'eval/aime25/answer_length': 1.5,
+                       'eval/aime25/finished': .5, 'eval/aime25/over_budget': .5}
 
 
 @pytest.mark.parametrize('trace,expected,mask', [
@@ -825,6 +1020,74 @@ def test_offline_cache_preparation_resumes_and_closes_within_teacher_budget(tmp_
     assert len(calls) == 1
 
 
+def test_a_generated_batch_is_stored_concurrently_on_slow_storage(tmp_path, monkeypatch):
+    import time
+    from src import adopd_cache
+    import transformers
+    model = tmp_path / 'model'; model.mkdir()
+    (model / 'model.safetensors').write_bytes(b'frozen')
+    cfg = {**options({}), 'teacher_model_path': str(model), 'teacher_tp_size': 1,
+           'max_prompt_length': 10, 'adopd_teacher_max_completion_length': 5,
+           'adopd_teacher_trace_cache': str(tmp_path / 'cache')}
+    tokenizer = SimpleNamespace(encode=lambda *a, **k: [99], eos_token_id=0, bos_token_id=0)
+    monkeypatch.setattr(transformers.AutoTokenizer, 'from_pretrained', lambda *a, **k: tokenizer)
+    class LLM:
+        def __init__(self, **kwargs): pass
+        def generate(self, prompts, params, **kwargs):
+            return [SimpleNamespace(outputs=[SimpleNamespace(token_ids=[4, 99])]) for _ in prompts]
+    class SamplingParams:
+        def __init__(self, **kwargs): self.__dict__.update(kwargs)
+    monkeypatch.setitem(sys.modules, 'vllm', SimpleNamespace(LLM=LLM, SamplingParams=SamplingParams))
+    write = TraceCache.write
+    def slow_write(self, *args):  # Network filesystems take seconds per small file.
+        time.sleep(0.2)
+        write(self, *args)
+    monkeypatch.setattr(TraceCache, 'write', slow_write)
+    prompts = [[i] for i in range(16)]
+    worker = adopd_cache.TeacherCacheWorker(cfg)
+    cache = TraceCache(cfg['adopd_teacher_trace_cache'], cache_identity(cfg))
+    start = time.monotonic()
+    adopd_cache.store(cache, prompts, worker.generate(prompts), 99)
+    assert time.monotonic() - start < 16 * 0.2 / 4
+    assert all(cache.read(p, 99)['trace_ids'] == [4, 99] for p in prompts)
+
+
+def test_cache_scan_and_validation_read_slow_storage_concurrently(tmp_path, monkeypatch):
+    import time
+    from src import adopd_cache
+    import transformers
+    model = tmp_path / 'model'; model.mkdir()
+    (model / 'model.safetensors').write_bytes(b'frozen')
+    cfg = {**options({}), 'teacher_model_path': str(model), 'teacher_tp_size': 1,
+           'max_prompt_length': 10, 'adopd_teacher_max_completion_length': 5,
+           'adopd_teacher_trace_cache': str(tmp_path / 'cache')}
+    tokenizer = SimpleNamespace(encode=lambda *a, **k: [99], eos_token_id=0, bos_token_id=0)
+    monkeypatch.setattr(transformers.AutoTokenizer, 'from_pretrained', lambda *a, **k: tokenizer)
+    prompts = [[i] for i in range(32)]
+    monkeypatch.setattr(adopd_cache, 'training_prompts', lambda *a: iter(prompts))
+    cache = TraceCache(cfg['adopd_teacher_trace_cache'], cache_identity(cfg))
+    for prompt in prompts[:16]:
+        cache.write(prompt, [4, 99], 99, False)
+    read = TraceCache.read
+    def slow_read(self, *args):  # Network filesystems take a fraction of a second per lookup.
+        time.sleep(0.1)
+        return read(self, *args)
+    monkeypatch.setattr(TraceCache, 'read', slow_read)
+    reported = []
+    monkeypatch.setattr(adopd_cache, 'prepare_distributed', lambda c, missing, reused: reported.append((missing, reused)))
+    start = time.monotonic()
+    adopd_cache.prepare({**cfg, 'h100_nnodes': 2, 'n_gpus_per_node': 1})
+    assert time.monotonic() - start < 32 * 0.1 / 4
+    assert reported == [(prompts[16:], 16)]
+    with pytest.raises(FileNotFoundError):
+        adopd_cache.validate_training_cache(cfg)
+    for prompt in prompts[16:]:
+        cache.write(prompt, [4, 99], 99, False)
+    start = time.monotonic()
+    assert adopd_cache.validate_training_cache(cfg) == 32
+    assert time.monotonic() - start < 32 * 0.1 / 4
+
+
 @pytest.mark.parametrize('nnodes,gpus,tp', [(2, 4, 4), (4, 4, 4), (4, 4, 1)])
 def test_cache_layout_uses_every_configured_gpu(nnodes, gpus, tp):
     from collections import Counter
@@ -874,9 +1137,7 @@ def test_distributed_cache_batches_are_unique_resume_and_release_workers(tmp_pat
             if fail:
                 raise RuntimeError('generation failed')
             generated.extend(tuple(p) for p in prompts)
-            for prompt in prompts:
-                cache.write(prompt, [7, 99], 99, False)
-            return len(prompts)
+            return [([7, prompt[0], 99], False) for prompt in prompts]  # the driver's node stores them
 
     class Factory:
         def options(self, *, scheduling_strategy):
@@ -919,6 +1180,7 @@ def test_distributed_cache_batches_are_unique_resume_and_release_workers(tmp_pat
         assert set(generated) == {(i,) for i in range(1, 21)}
         assert len(generated) == 20  # no duplicates and no re-generation of cached prompt 0
         assert len(closed) == nnodes
+        assert all(cache.read([i], 99)['trace_ids'] == [7, i, 99] for i in range(1, 21))
         adopd_cache.prepare(cfg)
         assert len(created) == nnodes  # fully cached runs start no engines
     assert {worker.node for worker in created} == {f'{i + 1:056x}' for i in range(nnodes)}
@@ -988,21 +1250,6 @@ if name == 'srun' and '--nodes=1' in sys.argv:
     assert not log.exists()  # allocation mismatches never start Ray or generation
 
 
-def test_eval_extra_metrics_group_by_benchmark_and_are_saved(tmp_path):
-    class Parent:
-        def _val_metrics_update(self, *args): return {'eval/aime25/avg@4': .5}
-    class Trainer(AdopdTrainerMixin, Parent): pass
-    trainer = Trainer()
-    trainer.config = SimpleNamespace(trainer=SimpleNamespace(default_local_dir=str(tmp_path)))
-    trainer.global_steps = 7
-    extras = dict(reasoning_length=[2, 8, 4], answer_length=[1, 2, 3], forced_halt=[0, 1, 1])
-    metrics = trainer._val_metrics_update(['aime25', 'amc23', 'aime25'], [], extras, [])
-    assert metrics['eval/aime25/reasoning_length'] == 3
-    assert metrics['eval/aime25/forced_halt'] == .5
-    assert metrics['eval/amc23/answer_length'] == 2
-    assert json.loads((tmp_path / 'eval_metrics/7.json').read_text()) == metrics
-
-
 @pytest.mark.parametrize('eval_only,group', [(False, False), (False, True), (True, True)])
 def test_trainer_native_init_guards_and_cache_setup(tmp_path, monkeypatch, eval_only, group):
     import src.adopd_trainer as module
@@ -1026,3 +1273,82 @@ def test_trainer_native_init_guards_and_cache_setup(tmp_path, monkeypatch, eval_
     native.actor_rollout_ref.actor.ppo_epochs = 2
     with pytest.raises(ValueError, match='one optimizer'):
         trainer.init_workers()
+
+
+class _GenBatch(SimpleNamespace):
+    def __len__(self):
+        return len(self.non_tensor_batch['raw_prompt'])
+
+
+@pytest.mark.parametrize('mode,expected', [(True, [True, True]), (False, [False, False]), ('initial', [True, False])])
+def test_validation_rows_carry_the_plain_prompt_decision_for_their_step(monkeypatch, mode, expected):
+    monkeypatch.setenv('ADOPD_CONFIG', json.dumps({'adopd_eval_plain_prompt': mode}))
+    class Parent:  # mirrors verl: _validate builds its generation batch through _get_gen_batch
+        def _get_gen_batch(self, batch):
+            return _GenBatch(non_tensor_batch=dict(batch))
+        def _validate(self):
+            return self._get_gen_batch({'raw_prompt': np.array(['a', 'b'], dtype=object)}).non_tensor_batch
+    class Trainer(AdopdTrainerMixin, Parent): pass
+    trainer = Trainer()
+    for step, plain in zip((0, 20), expected):
+        trainer.global_steps = step
+        assert list(trainer._validate()['adopd_eval_plain']) == [plain, plain]
+    training = trainer._get_gen_batch({'raw_prompt': np.array(['a'], dtype=object)})
+    assert 'adopd_eval_plain' not in training.non_tensor_batch
+
+
+def test_adopd_evaluates_with_a_longer_response_limit_than_training(tmp_path):
+    cfg = recipe()
+    cfg.update(val_max_completion_length=32768)
+    native = compose(cfg, tmp_path, [])
+    assert native.actor_rollout_ref.rollout.response_length == 16384
+    assert native.actor_rollout_ref.rollout.max_model_len == 4096 + 32768
+    opts = json.loads(native.ray_kwargs.ray_init.runtime_env.env_vars.ADOPD_CONFIG)
+    assert opts['eval_max_completion_length'] == 32768
+
+
+def test_eval_agent_scores_the_full_long_rollout_but_returns_a_training_sized_response(monkeypatch, budget_tokenizer):
+    import src.reward_async
+    from src.adopd_rollout import eval_agent_class
+    monkeypatch.setenv('ADOPD_CONFIG', json.dumps(dict(adopd_reasoning_budget=2, enabled=True,
+                                                       eval_max_completion_length=8)))
+    long_answer = [4, 4, 4, 4, 4, 99, 7]  # reasoning longer than the training response limit
+    seen = []
+
+    async def generate(**kwargs):
+        seen.append(kwargs['sampling_params']['max_tokens'])
+        return SimpleNamespace(token_ids=long_answer)
+
+    async def apply_template(messages):
+        return budget_tokenizer.apply_chat_template(messages)
+
+    async def score(source, text, truth):
+        return {'acc': float(text == truth)}
+
+    monkeypatch.setattr(src.reward_async, 'compute_score', score)
+    agent = object.__new__(eval_agent_class())
+    agent.tokenizer, agent.response_length = budget_tokenizer, 4
+    agent.apply_chat_template = apply_template
+    agent.server_manager = SimpleNamespace(generate=generate)
+    output = asyncio.run(agent.run({'temperature': 1.0}, raw_prompt=[{'role': 'user', 'content': 'q'}],
+        adopd_eval_plain=True, data_source='math', reward_model={'ground_truth': '7'}))
+    info = output.extra_fields['reward_extra_info']
+    assert seen == [8, 8]
+    assert info['acc'] == 1.0 and info['nobudget_acc'] == 1.0
+    assert output.response_ids == long_answer[:4] and output.response_mask == [1] * 4
+    assert info['full_response_length'] == 7 and info['nobudget_response_length'] == 7
+
+
+def test_eval_response_length_metrics_use_the_full_rollouts(tmp_path):
+    class Parent:
+        def _val_metrics_update(self, data_sources, sample_uids, extras, sample_turns):
+            return {'eval/amc23/response-length': sum(extras['response_length']) / len(extras['response_length'])}
+    class Trainer(AdopdTrainerMixin, Parent): pass
+    trainer = Trainer()
+    trainer.config = SimpleNamespace(trainer=SimpleNamespace(default_local_dir=str(tmp_path)),
+        actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(val_kwargs=SimpleNamespace(n=1))))
+    trainer.global_steps = 0
+    extras = dict(response_length=[4, 4], full_response_length=[7, 9], reasoning_length=[5, 6],
+                  answer_length=[1, 2], finished=[1., 1.], over_budget=[1., 1.])
+    metrics = trainer._val_metrics_update(['amc23'] * 2, ['a', 'b'], extras, [])
+    assert metrics['eval/amc23/response-length'] == 8

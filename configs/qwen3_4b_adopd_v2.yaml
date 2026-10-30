@@ -1,7 +1,7 @@
 # Frozen initial Qwen3-4B reference traces; ANSWER-only KL with selectable estimator.
 method: adopd
-model_path: /scratch/l/luli/data/Qwen3-4B
-teacher_model_path: /scratch/l/luli/data/Qwen3-4B
+model_path: /opt/tiger/models/Qwen3-4B
+teacher_model_path: /opt/tiger/models/Qwen3-4B
 auto_prepare_model: false
 local_models_only: true
 mode: thinking
@@ -10,20 +10,20 @@ group_size: 8
 adopd_reasoning_budget: 8192 # controls both the student budget prompt and hard cutoff
 adopd_teacher_max_completion_length: 16384
 adopd_length_penalty: 0.1 # active in both modes; 0 disables the single-rollout length PG
-adopd_teacher_trace_cache: /scratch/l/luli/src/opd-baselines/data/.cache/adopd_v2
+adopd_teacher_trace_cache: /opt/tiger/opd-baselines/data/.cache/adopd_v2 # head-local; read by the driver only
 adopd_cache_seed: 42
-adopd_cache_batch_size: 16
+adopd_cache_batch_size: 64 # prompts per replica request; ~fills one H100 KV cache at 16k tokens
 max_completion_length: 16384 # reasoning + forced halt (if any) + answer
 project_name: efficient-reasoning
 experiment_name: qwen3_4b_adopd_v2
-output_dir: /scratch/l/luli/src/opd-baselines/outputs/adopd-v2
+output_dir: /opt/tiger/opd-baselines/outputs/adopd-v2 # node-local; each node keeps its own FSDP shards
 use_wandb: true
-wandb_mode: offline
-wandb_entity: null
-h100_nnodes: 4
-n_gpus_per_node: 4
+wandb_mode: online
+wandb_entity: li-jiang-research
+h100_nnodes: 2
+n_gpus_per_node: 8
 vllm_tensor_parallel_size: 1
-# 16 trajectories/GPU/update: 2x4 GPUs => 128; 4x4 GPUs => 256.
+# 16 trajectories/GPU/update: 2x8 GPUs => 256 prompts x 1 (or 32 x 8 with groups).
 per_device_batch_size: 16
 ppo_mini_batch_size: null # one complete rollout batch, derived from the GPU count
 actor_use_dynamic_bsz: false
@@ -43,8 +43,8 @@ top_p: 1.0
 top_k_sampling: -1
 vllm_gpu_memory_utilization: 0.4
 teacher_enable_resource_pool: false
-teacher_n_gpus_per_node: 4
-teacher_tp_size: 4
+teacher_n_gpus_per_node: 8
+teacher_tp_size: 1 # 4B fits on one GPU: 16 cache replicas on 2x8 GPUs
 teacher_gpu_memory_utilization: 0.25
 distillation_num_workers: 8
 distillation_loss_mode: k1 # native registration; actual answer loss is selected below
@@ -52,11 +52,11 @@ distillation_use_task_rewards: false
 opd_loss_token_mode: sample # sample or full_vocab; both supervise only answer positions
 opd_distribution_chunk_size: 32 # answer positions per full-vocabulary reconstruction chunk
 opd_enable_metrics: false
-train_files: /scratch/l/luli/data/lightning_opd/train/dapo_math_17k_en.parquet
+train_files: /opt/tiger/opd-baselines/data/train/dapo_math_17k_en.parquet
 val_files:
-- /scratch/l/luli/data/lightning_opd/eval/aime25.parquet
-- /scratch/l/luli/data/lightning_opd/eval/aime26.parquet
-- /scratch/l/luli/data/lightning_opd/eval/amc23.parquet
+- /opt/tiger/opd-baselines/data/eval/aime25.parquet
+- /opt/tiger/opd-baselines/data/eval/aime26.parquet
+- /opt/tiger/opd-baselines/data/eval/amc23.parquet
 val_before_train: true
 eval_steps: 20
 val_max_prompt_length: 4096
@@ -68,7 +68,7 @@ val_top_p: 1.0
 val_top_k: -1
 val_batch_size: 16
 save_eval_generations: false
-save_steps: 5
+save_steps: 20 # ~56 GB per checkpoint on HDFS: saves at 20, 40 and the final step
 max_checkpoints_to_keep: 1
 checkpoint_save_contents: [model, optimizer, extra, hf_model]
 h100_runtime:
