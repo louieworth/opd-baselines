@@ -1,7 +1,6 @@
 """Driver-side ADOPD mixin; all group statistics are fixed before DP sharding."""
 
 import json
-from itertools import product
 from pathlib import Path
 
 import numpy as np
@@ -126,20 +125,23 @@ class AdopdTrainerMixin:
         # verl measures the returned, training-sized response; the length that was scored is the full rollout.
         full = dict(reward_extra_infos_dict, response_length=reward_extra_infos_dict['full_response_length'])
         metrics = super()._val_metrics_update(data_sources, sample_uids, full, sample_turns)
-        # The rollout without the budget instruction, when run, is scored exactly like the budgeted one.
-        prefixes = ('', 'nobudget_') if 'nobudget_acc' in reward_extra_infos_dict else ('',)
-        if 'nobudget_acc' in reward_extra_infos_dict:
-            plain = compute_eval_metrics(data_sources, sample_uids, reward_extra_infos_dict['nobudget_acc'],
-                k=self.config.actor_rollout_ref.rollout.val_kwargs.n,
-                response_lengths=reward_extra_infos_dict['nobudget_response_length'])
-            metrics.update({key.replace('eval/', 'eval_nobudget/', 1): value for key, value in plain.items()})
+        info = reward_extra_infos_dict
+        # The plain-prompt rollout and every named eval variant are scored like the main one, each in its own group.
+        groups = [('', 'eval')] + ([('nobudget_', 'eval_nobudget')] if 'nobudget_acc' in info else [])
+        groups += [(f"{v['name']}_", f"eval_{v['name']}") for v in runtime_options().get('adopd_eval_variants') or []]
+        for prefix, group in groups[1:]:
+            lengths = info['nobudget_response_length'] if prefix == 'nobudget_' else info[prefix + 'full_response_length']
+            extra = compute_eval_metrics(data_sources, sample_uids, info[prefix + 'acc'],
+                k=self.config.actor_rollout_ref.rollout.val_kwargs.n, response_lengths=lengths)
+            metrics.update({key.replace('eval/', f'{group}/', 1): value for key, value in extra.items()})
         for source in set(data_sources):
             indices = [i for i, value in enumerate(data_sources) if value == source]
-            for prefix, field in product(prefixes,
-                                         ('reasoning_length', 'answer_length', 'finished', 'over_budget')):
-                values = reward_extra_infos_dict[prefix + field]
-                group = 'eval_nobudget' if prefix else 'eval'
-                metrics[f'{group}/{source}/{field}'] = sum(float(values[i]) for i in indices) / len(indices)
+            for prefix, group in groups:
+                fields = ('reasoning_length', 'answer_length', 'finished', 'over_budget')
+                fields += ('forced_halt',) if prefix + 'forced_halt' in info else ()
+                for field in fields:
+                    values = info[prefix + field]
+                    metrics[f'{group}/{source}/{field}'] = sum(float(values[i]) for i in indices) / len(indices)
         path = Path(self.config.trainer.default_local_dir) / 'eval_metrics'
         path.mkdir(parents=True, exist_ok=True)
         (path / f'{self.global_steps}.json').write_text(json.dumps(metrics, indent=2) + '\n')

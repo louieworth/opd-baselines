@@ -156,7 +156,12 @@ def test_eval_preserves_budget_without_teacher_or_cache(tmp_path, monkeypatch, m
 @pytest.mark.parametrize('key,value', [('adopd_use_group_rollouts', 'true'),
     ('adopd_reasoning_budget', 16383), ('adopd_length_penalty', -1),
     ('adopd_length_penalty', float('nan')), ('adopd_teacher_trace_cache', 'relative'),
-    ('adopd_cache_seed', True), ('adopd_cache_batch_size', 0), ('adopd_eval_plain_prompt', 'false'),
+    ('adopd_cache_seed', True), ('adopd_cache_batch_size', 0), ('adopd_eval_plain_prompt', 'false'), ('adopd_eval_variants', {'name': 'x'}),
+    ('adopd_eval_variants', [{'name': '16k', 'budget': 2, 'limit': 16384}]),
+    ('adopd_eval_variants', [{'name': '16k', 'budget': 2, 'limit': 16384, 'forced': 'yes'}]),
+    ('adopd_eval_variants', [{'name': 'a b', 'budget': 2, 'limit': 16384, 'forced': False}]),
+    ('adopd_eval_variants', [{'name': 'x', 'budget': 2, 'limit': 9, 'forced': False}] * 2),
+    ('adopd_eval_variants', [{'name': 'x', 'budget': 9, 'limit': 9, 'forced': True}]),
     ('opd_loss_token_mode', 'top_k_teacher'), ('opd_distribution_chunk_size', 0)])
 def test_invalid_options(key, value):
     with pytest.raises(ValueError):
@@ -408,7 +413,7 @@ def test_eval_agent_scores_unforced_rollouts_with_and_without_budget_prompt(monk
     from src.adopd_prompt import prompt_pair_ids
     from src.adopd_rollout import eval_agent_class
     monkeypatch.setenv('ADOPD_CONFIG', json.dumps(dict(adopd_reasoning_budget=2, enabled=True,
-                                                       eval_max_completion_length=6)))
+                                                       eval_max_completion_length=6, adopd_eval_variants=None)))
     messages = [{'role': 'user', 'content': 'q'}]
     teacher, student = prompt_pair_ids(budget_tokenizer, messages, 2)
     calls = []
@@ -451,7 +456,7 @@ def test_budget_only_eval_skips_the_plain_prompt_rollout(monkeypatch, budget_tok
     from src.adopd_prompt import prompt_pair_ids
     from src.adopd_rollout import eval_agent_class
     monkeypatch.setenv('ADOPD_CONFIG', json.dumps(dict(adopd_reasoning_budget=2, enabled=True,
-                                                       eval_max_completion_length=6)))
+                                                       eval_max_completion_length=6, adopd_eval_variants=None)))
     messages = [{'role': 'user', 'content': 'q'}]
     _, student = prompt_pair_ids(budget_tokenizer, messages, 2)
     calls = []
@@ -1311,7 +1316,7 @@ def test_eval_agent_scores_the_full_long_rollout_but_returns_a_training_sized_re
     import src.reward_async
     from src.adopd_rollout import eval_agent_class
     monkeypatch.setenv('ADOPD_CONFIG', json.dumps(dict(adopd_reasoning_budget=2, enabled=True,
-                                                       eval_max_completion_length=8)))
+                                                       eval_max_completion_length=8, adopd_eval_variants=None)))
     long_answer = [4, 4, 4, 4, 4, 99, 7]  # reasoning longer than the training response limit
     seen = []
 
@@ -1352,3 +1357,190 @@ def test_eval_response_length_metrics_use_the_full_rollouts(tmp_path):
                   answer_length=[1, 2], finished=[1., 1.], over_budget=[1., 1.])
     metrics = trainer._val_metrics_update(['amc23'] * 2, ['a', 'b'], extras, [])
     assert metrics['eval/amc23/response-length'] == 8
+
+
+def test_eval_variants_are_validated_and_default_to_the_single_configured_eval():
+    assert options({})['adopd_eval_variants'] is None
+    variants = [dict(name='32k', budget=4096, limit=32768, forced=False),
+                dict(name='forced', budget=4096, limit=16384, forced=True)]
+    assert options({'adopd_eval_variants': variants})['adopd_eval_variants'] == variants
+    # A variant without a budget uses the run's own reasoning budget.
+    from src.adopd_options import eval_variants
+    run = options({'adopd_reasoning_budget': 2048, 'adopd_eval_variants': [dict(name='16k', limit=16384, forced=True)]})
+    assert eval_variants(run) == [dict(name='16k', budget=2048, limit=16384, forced=True)]
+    assert eval_variants(options({})) is None
+
+
+def test_a_budget_override_on_the_command_line_reaches_variants_without_their_own_budget(tmp_path):
+    import yaml
+    from src.adopd_options import eval_variants
+    path = tmp_path / 'recipe.yaml'
+    cfg = recipe()
+    cfg['adopd_eval_variants'] = [dict(name='forced', limit=16384, forced=True)]
+    path.write_text(yaml.safe_dump(cfg))
+    loaded = run_baseline.load_config(path)
+    run_baseline.apply_opd_overrides(loaded, ['adopd_reasoning_budget=2048'])
+    assert eval_variants(run_baseline.adopd_options(loaded))[0]['budget'] == 2048
+
+
+@pytest.mark.parametrize('rollout,response,forced', [
+    ([4, 4, 4, 4], [4, 4, 99, 7], 1.0),  # still reasoning at the budget: cut there, </think> inserted, answer generated
+    ([4, 99, 7], [4, 99, 7], 0.0),       # closed its own trace within the budget: the rollout is used as is
+])
+def test_forced_eval_reuses_the_long_rollout_and_only_generates_the_answer(
+        monkeypatch, budget_tokenizer, rollout, response, forced):
+    import src.reward_async
+    from src.adopd_rollout import eval_agent_class
+    monkeypatch.setenv('ADOPD_CONFIG', json.dumps(dict(adopd_reasoning_budget=2, enabled=True,
+                                                       eval_max_completion_length=8, adopd_eval_variants=[
+        dict(name='forced', budget=2, limit=8, forced=True)])))
+    calls = []
+
+    async def generate(*, request_id, prompt_ids, sampling_params):
+        calls.append((list(prompt_ids), dict(sampling_params)))
+        return SimpleNamespace(token_ids=rollout if len(calls) == 1 else [7])
+
+    async def apply_template(messages):
+        return budget_tokenizer.apply_chat_template(messages)
+
+    async def score(source, text, truth):
+        return {'acc': float(text == truth)}
+
+    monkeypatch.setattr(src.reward_async, 'compute_score', score)
+    agent = object.__new__(eval_agent_class())
+    agent.tokenizer, agent.response_length = budget_tokenizer, 8
+    agent.apply_chat_template = apply_template
+    agent.server_manager = SimpleNamespace(generate=generate)
+    output = asyncio.run(agent.run({'temperature': 1.0}, raw_prompt=[{'role': 'user', 'content': 'q'}],
+        adopd_eval_plain=False, data_source='math', reward_model={'ground_truth': '7'}))
+    info = output.extra_fields['reward_extra_info']
+    assert calls[0][1]['max_tokens'] == 8 and not calls[0][1].get('stop_token_ids')
+    if forced:  # only the answer is generated, after the kept reasoning and the inserted </think>
+        assert len(calls) == 2 and calls[1][0] == calls[0][0] + [4, 4, 99] and calls[1][1]['max_tokens'] == 8 - 3
+    else:
+        assert len(calls) == 1
+    assert output.response_ids == response
+    assert info['acc'] == 1.0 and info['forced_halt'] == forced
+    assert info['reasoning_length'] == response.index(99) and info['full_response_length'] == len(response)
+
+
+def test_a_shorter_unforced_variant_is_the_longer_rollout_cut_at_its_limit(monkeypatch, budget_tokenizer):
+    import src.reward_async
+    from src.adopd_rollout import eval_agent_class
+    monkeypatch.setenv('ADOPD_CONFIG', json.dumps(dict(adopd_reasoning_budget=2, enabled=True,
+        eval_max_completion_length=9, adopd_eval_variants=[dict(name='long', budget=2, limit=9, forced=False),
+                                                           dict(name='short', budget=2, limit=4, forced=False)])))
+    calls = []
+
+    async def generate(*, request_id, prompt_ids, sampling_params):
+        calls.append(dict(sampling_params))
+        return SimpleNamespace(token_ids=[5, 5, 5, 5, 5, 99, 7])
+
+    async def apply_template(messages):
+        return budget_tokenizer.apply_chat_template(messages)
+
+    async def score(source, text, truth):
+        return {'acc': float(text == truth)}
+
+    monkeypatch.setattr(src.reward_async, 'compute_score', score)
+    agent = object.__new__(eval_agent_class())
+    agent.tokenizer, agent.response_length = budget_tokenizer, 9
+    agent.apply_chat_template = apply_template
+    agent.server_manager = SimpleNamespace(generate=generate)
+    info = asyncio.run(agent.run({'temperature': 1.0}, raw_prompt=[{'role': 'user', 'content': 'q'}],
+        adopd_eval_plain=False, data_source='math', reward_model={'ground_truth': '7'})).extra_fields['reward_extra_info']
+    assert [c['max_tokens'] for c in calls] == [9]  # one generation serves both limits
+    assert info['long_acc'] == 1.0 and info['long_full_response_length'] == 7
+    assert info['short_acc'] == 0.0 and info['short_finished'] == 0.0 and info['short_full_response_length'] == 4
+
+
+def test_eval_reports_how_often_the_halt_was_forced(tmp_path):
+    class Parent:
+        def _val_metrics_update(self, data_sources, sample_uids, extras, sample_turns):
+            return {}
+    class Trainer(AdopdTrainerMixin, Parent): pass
+    trainer = Trainer()
+    trainer.config = SimpleNamespace(trainer=SimpleNamespace(default_local_dir=str(tmp_path)),
+        actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(val_kwargs=SimpleNamespace(n=1))))
+    trainer.global_steps = 0
+    extras = dict(response_length=[4, 4], full_response_length=[4, 3], reasoning_length=[2, 1],
+                  answer_length=[1, 1], finished=[1., 1.], over_budget=[0., 0.], forced_halt=[1., 0.])
+    metrics = trainer._val_metrics_update(['amc23'] * 2, ['a', 'b'], extras, [])
+    assert metrics['eval/amc23/forced_halt'] == 0.5
+    del extras['forced_halt']
+    assert 'eval/amc23/forced_halt' not in trainer._val_metrics_update(['amc23'] * 2, ['a', 'b'], extras, [])
+
+
+
+def test_every_eval_variant_runs_for_each_question_and_is_scored_on_its_own(monkeypatch, budget_tokenizer):
+    import src.reward_async
+    from src.adopd_rollout import eval_agent_class
+    variants = [dict(name='long', budget=2, limit=9, forced=False),
+                dict(name='forced', budget=3, limit=7, forced=True)]
+    monkeypatch.setenv('ADOPD_CONFIG', json.dumps(dict(adopd_reasoning_budget=2, enabled=True,
+                                                       eval_max_completion_length=9, adopd_eval_variants=variants)))
+    calls = []
+
+    async def generate(*, request_id, prompt_ids, sampling_params):
+        calls.append((list(prompt_ids), dict(sampling_params)))
+        if sampling_params['max_tokens'] == 9:      # one long rollout per budget prompt: reasons, closes, answers
+            return SimpleNamespace(token_ids=[5, 5, 5, 5, 5, 99, 7])
+        return SimpleNamespace(token_ids=[8])       # forced variant, answer after the inserted </think>
+
+    async def apply_template(messages):
+        return budget_tokenizer.apply_chat_template(messages)
+
+    async def score(source, text, truth):
+        return {'acc': float(text == truth)}
+
+    monkeypatch.setattr(src.reward_async, 'compute_score', score)
+    agent = object.__new__(eval_agent_class())
+    agent.tokenizer, agent.response_length = budget_tokenizer, 9
+    agent.apply_chat_template = apply_template
+    agent.server_manager = SimpleNamespace(generate=generate)
+    output = asyncio.run(agent.run({'temperature': 1.0}, raw_prompt=[{'role': 'user', 'content': 'q'}],
+        adopd_eval_plain=False, data_source='math', reward_model={'ground_truth': '7'}))
+    info = output.extra_fields['reward_extra_info']
+    long = [c for c in calls if c[1]['max_tokens'] == 9]
+    answer = [c for c in calls if c[1]['max_tokens'] != 9]
+    # Each budget prompt is asked once; the forced variant keeps 3 reasoning tokens of its own prompt's rollout.
+    assert len(long) == 2 and long[0][0] != long[1][0] and len(answer) == 1
+    assert answer[0][0] in (long[0][0] + [5, 5, 5, 99], long[1][0] + [5, 5, 5, 99])
+    assert answer[0][1]['max_tokens'] == 7 - 4
+    assert info['long_acc'] == 1.0 and info['long_full_response_length'] == 7 and info['long_reasoning_length'] == 5
+    assert info['forced_acc'] == 0.0 and info['forced_forced_halt'] == 1.0 and info['forced_full_response_length'] == 5
+    # The first variant is also the main evaluation result that verl reports.
+    assert info['acc'] == info['long_acc'] and output.response_ids == [5, 5, 5, 5, 5, 99, 7]
+
+
+def test_each_eval_variant_gets_its_own_metric_group(tmp_path, monkeypatch):
+    from src.eval_metrics import compute_eval_metrics
+    monkeypatch.setenv('ADOPD_CONFIG', json.dumps(dict(adopd_eval_variants=[
+        dict(name='long', budget=2, limit=9, forced=False), dict(name='forced', budget=3, limit=7, forced=True)])))
+    class Parent:
+        def _val_metrics_update(self, data_sources, sample_uids, extras, sample_turns):
+            return compute_eval_metrics(data_sources, sample_uids, extras['acc'], k=1,
+                                        response_lengths=extras['response_length'])
+    class Trainer(AdopdTrainerMixin, Parent): pass
+    trainer = Trainer()
+    trainer.config = SimpleNamespace(trainer=SimpleNamespace(default_local_dir=str(tmp_path)),
+        actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(val_kwargs=SimpleNamespace(n=1))))
+    trainer.global_steps = 20
+    base = dict(reasoning_length=[5, 4], answer_length=[1, 1], finished=[1., 1.], over_budget=[1., 1.])
+    extras = dict(acc=[1., 0.], response_length=[7, 6], full_response_length=[7, 6], **base)
+    extras.update({f'long_{k}': v for k, v in dict(acc=[1., 0.], full_response_length=[7, 6], **base).items()})
+    extras.update({f'forced_{k}': v for k, v in dict(acc=[0., 0.], full_response_length=[5, 3], forced_halt=[1., 0.],
+                                                     **base).items()})
+    metrics = trainer._val_metrics_update(['amc23'] * 2, ['a', 'b'], extras, [])
+    assert metrics['eval_long/amc23/avg@1'] == 0.5 and metrics['eval_long/amc23/response-length'] == 6.5
+    assert metrics['eval_forced/amc23/avg@1'] == 0.0 and metrics['eval_forced/amc23/response-length'] == 4
+    assert metrics['eval_forced/amc23/forced_halt'] == 0.5 and metrics['eval_long/amc23/reasoning_length'] == 4.5
+    assert 'eval_long/amc23/forced_halt' not in metrics and metrics['eval/amc23/avg@1'] == 0.5
+
+
+def test_eval_variant_longer_than_the_rollout_server_allows_is_rejected(tmp_path):
+    cfg = recipe()
+    cfg.update(val_max_completion_length=16384,
+               adopd_eval_variants=[dict(name='32k', budget=4096, limit=32768, forced=False)])
+    with pytest.raises(ValueError, match='val_max_completion_length'):
+        compose(cfg, tmp_path, [])

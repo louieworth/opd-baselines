@@ -32,6 +32,12 @@ async def budget_rollout(generate, prompt_ids, sampling_params, halt_token_id,
     return tokens + answer_tokens, chosen + [1] * len(answer_tokens)
 
 
+def blocked_eos(tokenizer):
+    """Qwen's end-of-text token is also its BOS and a secondary EOS; neither may end a reasoning trace."""
+    eos_ids = {tokenizer.eos_token_id, tokenizer.bos_token_id} - {None}
+    return [tokenizer.decode([token]) for token in sorted(eos_ids)]
+
+
 async def free_rollout(generate, prompt_ids, sampling_params, response_budget):
     """Unforced evaluation rollout: the policy alone decides when, or whether, to close its trace."""
     output = await generate(request_id=uuid4().hex, prompt_ids=list(prompt_ids),
@@ -68,9 +74,7 @@ def agent_class():
             prompt = await self.apply_chat_template(
                 student_messages(messages, opts['adopd_reasoning_budget']))
             halt = halt_id(self.tokenizer)
-            # Qwen's end-of-text token is also its BOS and a secondary EOS.
-            eos_ids = {self.tokenizer.eos_token_id, self.tokenizer.bos_token_id} - {None}
-            blocked = [self.tokenizer.decode([token]) for token in sorted(eos_ids)]
+            blocked = blocked_eos(self.tokenizer)
             metrics = {}
             with simple_timer('generate_sequences', metrics):
                 tokens, chosen = await budget_rollout(self.server_manager.generate, prompt,
@@ -95,34 +99,75 @@ def eval_agent_class():
     from src.adopd_cache import halt_id
     from src.adopd_options import runtime_options
 
+    from src.adopd_options import eval_variants
+
     class AdopdEvalAgentLoop(SingleTurnAgentLoop):
-        """Evaluation never forces a halt: one rollout with the budget instruction, optionally one without."""
+        """Every eval variant for each question (plus the plain prompt when asked), all from one long rollout.
+
+        A rollout with a shorter limit is the long rollout cut at that limit. A forced variant keeps the
+        rollout if it closed its trace within the budget; otherwise it keeps the first budget reasoning
+        tokens, inserts </think>, and generates only the answer within its limit.
+        """
 
         async def run(self, sampling_params, **kwargs):
             options = runtime_options()
-            budget = options['adopd_reasoning_budget']
+            # Without explicit variants: one unforced evaluation at the configured limit, reported under eval/.
+            variants = eval_variants(options) or [dict(
+                name='', budget=options['adopd_reasoning_budget'],
+                limit=options['eval_max_completion_length'], forced=False)]
             messages = list(kwargs['raw_prompt'])
             plain = await self.apply_chat_template(messages)
-            prompt = await self.apply_chat_template(student_messages(messages, budget))
-            # The trainer decides per evaluation step whether the plain prompt runs too.
-            prompts = (prompt, plain) if kwargs['adopd_eval_plain'] else (prompt,)
+            prompts = {budget: await self.apply_chat_template(student_messages(messages, budget))
+                       for budget in {variant['budget'] for variant in variants}}
             halt = halt_id(self.tokenizer)
+            eos = {self.tokenizer.eos_token_id, self.tokenizer.bos_token_id} - {None}
+            longest = max(variant['limit'] for variant in variants)
+
+            async def scored(ids, rollout, variant):
+                budget, limit = variant['budget'], variant['limit']
+                extra = {}
+                if not variant['forced'] or halt in rollout[:budget]:
+                    tokens = rollout[:limit]
+                else:
+                    trace = rollout[:budget]
+                    while trace and trace[-1] in eos:  # an early end-of-text is not an answer
+                        trace.pop()
+                    trace.append(halt)
+                    answer = await self.server_manager.generate(request_id=uuid4().hex, prompt_ids=list(ids) + trace,
+                        sampling_params=dict(sampling_params, max_tokens=limit - len(trace)))
+                    tokens = trace + list(answer.token_ids)[:limit - len(trace)]
+                if variant['forced']:
+                    extra['forced_halt'] = float(halt not in rollout[:budget])
+                score = await answer_score(self.tokenizer, tokens, halt, budget, kwargs['data_source'],
+                                           kwargs['reward_model']['ground_truth'])
+                # verl pads eval responses to the training length but never truncates them; scores and this
+                # length cover the full rollout.
+                return tokens, dict(score, full_response_length=len(tokens), **extra)
+
+            asked = dict(prompts)
+            # The trainer decides per evaluation step whether the plain prompt runs too (as the first variant).
+            if kwargs['adopd_eval_plain']:
+                asked['plain'] = plain
             metrics = {}
             with simple_timer('generate_sequences', metrics):
-                rollouts = await asyncio.gather(*(
-                    free_rollout(self.server_manager.generate, ids, sampling_params, options['eval_max_completion_length'])
-                    for ids in prompts))
-            score, *plain_score = await asyncio.gather(*(
-                answer_score(self.tokenizer, ids, halt, budget, kwargs['data_source'],
-                             kwargs['reward_model']['ground_truth'])
-                for ids in rollouts))
-            # verl pads eval responses to the training length but never truncates them; the scores above
-            # and these lengths cover the full rollout.
-            tokens = rollouts[0][:self.response_length]
-            score.update(full_response_length=len(rollouts[0]))
-            if plain_score:
-                score.update({f'nobudget_{key}': value for key, value in plain_score[0].items()},
-                             nobudget_response_length=len(rollouts[1]))
+                rollouts = dict(zip(asked, await asyncio.gather(*(
+                    free_rollout(self.server_manager.generate, ids, sampling_params, longest) for ids in asked.values()))))
+                jobs = [scored(prompts[v['budget']], rollouts[v['budget']], v) for v in variants]
+                if kwargs['adopd_eval_plain']:
+                    jobs.append(scored(plain, rollouts['plain'], variants[0]))
+                results = await asyncio.gather(*jobs)
+            # The first variant is the main result verl reports; every named variant also gets its own prefix.
+            first_tokens, score = results[0]
+            score = dict(score)
+            for variant, (_, result) in zip(variants, results):
+                if variant['name']:
+                    score.update({f"{variant['name']}_{key}": value for key, value in result.items()})
+            if kwargs['adopd_eval_plain']:
+                plain_tokens, plain_score = results[-1]
+                score.update({f'nobudget_{key}': value for key, value in plain_score.items()},
+                             nobudget_response_length=len(plain_tokens))
+            tokens = first_tokens[:self.response_length]
+            prompt = prompts[variants[0]['budget']]
             return AgentLoopOutput(prompt_ids=prompt, response_ids=tokens, response_mask=[1] * len(tokens),
                 reward_score=score['acc'], num_turns=1, metrics=metrics,
                 extra_fields={'reward_extra_info': score, 'turn_scores': [], 'tool_rewards': [],

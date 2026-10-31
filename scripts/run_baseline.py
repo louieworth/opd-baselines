@@ -641,6 +641,8 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
 
     if adopd:
         extension = adopd_options(cfg)
+        if any(v['limit'] > val_max_response for v in extension['adopd_eval_variants'] or []):
+            raise ValueError('ADOPD eval variants must fit within val_max_completion_length')
         extension.update(enabled=not eval_only, eval_only=eval_only, group_size=cfg['group_size'],
                          max_completion_length=max_response, eval_max_completion_length=val_max_response,
                          objective=adopd_objective_name(cfg), h100_runtime=bool(cfg.get('h100_runtime')))
