@@ -1,23 +1,23 @@
 # TODO — ADOPD v2 efficient reasoning
 
-更新时间：2026-10-31 20:00 UTC。集群：2 × 8 H100（Ray head + workera），所有产物都在容器内。
+更新时间：2026-10-31 21:30 UTC。集群：2 × 8 H100（Ray head + workera），所有产物都在容器内。
 
 ## 进行中
 
-- [ ] Qwen3-14B base 的 forced `</think>` eval：budget prompt 2k / 4k / 8k，强制截断并只续写答案（同时得到 16k），avg@8 —— 19:43 UTC 开始
-- [ ] 实例分析的真实轨迹：4B base vs 4B 8k（step 56），8B base vs 8B 4k（step 56）；AMC23 / AIME25 / GPQA 物理各 3 题 × 4 个样本，自由生成（32k）+ 强制 `</think>`
-- [ ] Qwen3-14B 4k、2k（256 × 56，32k eval，step 0 不 eval）
+- [ ] Qwen3-14B 4k → 2k（256 × 56，32k eval，step 0 不 eval）—— 20:43 UTC 开始（`tmp/chain_14b_more.sh`）
+- [ ] CRISP 基线（`tmp/chain_crisp.sh`，在 14B 之后自动开始，约 11/01 08:00 UTC）：
+  - 4B 冒烟测试：2 次更新，在第 2 次更新前刷新 teacher；不通过就停下。
+  - 4B → 8B → 14B 正式训练；每个 run 结束后在 step 20/40/56 做 eval（不加 budget prompt；32k，以及在 8k/4k/2k 处强制 `</think>`），然后删除 FSDP 分片。
 
-以上由 `tmp/chain_14b_more.sh` 串行执行：启动阶段失败自动重试 3 次，每个 run 结束后删除 FSDP 分片、保留 HF 权重。
+两个串联脚本都在启动阶段失败时自动重试 3 次。
 
 ## 待办
 
-- [ ] **CRISP 基线**（Compressed Reasoning via Iterative Self-Policy Distillation）：沿用当前的实验参数（训练 response 16k、256 × 56），只换成它的算法形式（teacher prompt 带 shorter CoT 指令）；4B、8B、14B 各跑一遍，eval 做 32k 和强制 `</think>` 两个版本，step 0 不 eval
-- [ ] 实例分析文档：用上面的真实轨迹，分析方法为什么有效
-- [ ] 14B 4k/2k、14B base forced 的结果写入 wandb（`eval_avg8_*`），并补进本文
-- [ ] 更新 Google Slides（第 21/24/25 页仍是 16k 口径），加入 4B/8B/14B 矩阵和跨模型对比
+- [ ] CRISP 的 eval 结果写入各自训练 run 的 wandb（`eval_avg8_32k/`、`eval_avg8_forced_b*/`），并补进本文
+- [ ] 14B 4k/2k 的结果写入 wandb（`eval_avg8_32k/`），并补进本文
+- [ ] 更新 Google Slides（第 21/24/25 页仍是 16k 口径），加入 4B/8B/14B 矩阵、跨模型对比、base forced 对比和实例分析
 - [ ] 端口竞争的根治：verl 在临时端口段（32768–63999）里选 `MASTER_PORT` 后再 bind，会被其他进程抢占（`EADDRINUSE` / TCPStore 30 分钟超时）。给 worker group 传 `master_port_range`（< 32768），并保证并发创建的 group 不重叠
-- [ ] 把可复用的运维脚本从 `tmp/`（gitignored）提升到 `scripts/`：eval 矩阵生成、wandb 合并日志、FSDP 分片清理、表格生成（`tmp/report_tables.py`）
+- [ ] 把可复用的运维脚本从 `tmp/`（gitignored）提升到 `scripts/`：eval 矩阵生成、wandb 合并日志、FSDP 分片清理、表格生成（`tmp/report_tables.py`）、实例分析（`tmp/case_study/`）
 - [ ] 两个 `test_sbatch_reads_yaml_allocation_and_launches_all_nodes` 测试依赖 `/scratch` 路径，在本集群上一直失败
 - [ ] worker 磁盘：`/opt/tiger/refine_opsd_persist`（1.36T，非本项目）是否删除待定
 
@@ -183,6 +183,42 @@ base（step 0，plain，32k）：acc 0.706，长度 14,103
 
 4B/8B 的“同 prompt”基线来自各自 base 的合并 eval；8B base 的 8k prompt 两次 eval 分别为 13,497（128×112 run 的 step 0）和 13,620（合并 eval）。
 
+### base model 强制 `</think>`（4B / 8B / 14B × 2k / 4k / 8k）
+
+不训练，用对应 budget 的 prompt；同一条 rollout 若在 budget 内没结束思考，就截断、插入 `</think>`、只续写答案（总长 ≤ 16k）。avg@8，6 个数据集。
+
+| model | base plain 32k | budget | forced acc | forced 长度 | 推理 | 答案 | 被强制比例 | 16k acc | 16k 长度 |
+|---|---|---|---|---|---|---|---|---|---|
+| 4B | 0.699 / 13,692 | 8k | 0.601 | 8,469 | 6,327 | 2,141 | 0.52 | 0.586 | 10,136 |
+| 4B | | 4k | 0.570 | 6,361 | 3,693 | 2,667 | 0.76 | 0.601 | 9,891 |
+| 4B | | 2k | 0.528 | 5,498 | 1,990 | 3,508 | 0.92 | 0.592 | 9,908 |
+| 8B | 0.706 / 14,103 | 8k | 0.602 | 9,591 | 6,680 | 2,910 | 0.59 | 0.581 | 10,805 |
+| 8B | | 4k | 0.589 | 8,078 | 3,804 | 4,273 | 0.81 | 0.584 | 10,690 |
+| 8B | | 2k | 0.561 | 7,427 | 2,007 | 5,419 | 0.93 | 0.594 | 10,618 |
+| 14B | 0.744 / 12,750 | 8k | 0.664 | 8,158 | 6,358 | 1,799 | 0.52 | 0.653 | 10,058 |
+| 14B | | 4k | 0.605 | 6,243 | 3,731 | 2,511 | 0.76 | 0.649 | 9,957 |
+| 14B | | 2k | 0.549 | 4,798 | 1,994 | 2,802 | 0.91 | 0.640 | 9,766 |
+
+- budget 越紧，acc 越低（8k → 2k 掉 7–12 pts），被强制的比例从约 0.5 升到约 0.92。
+- 被强制后，base 会在 `</think>` 之后继续推理：budget 越紧答案越长，8B 在 2k 时答案 5.4k，比推理本身还长。
+- 在 8k 处强制 `</think>` 比直接截到 16k 更好（4B 0.601 vs 0.586，14B 0.664 vs 0.653）。
+
+### 实例分析（详见 `analysis/case_studies.md`）
+
+4B base vs 4B 8k（step 56），8B base vs 8B 4k（step 56）；AMC23 / AIME25 / GPQA 物理各 3 题 × 4 个样本，自由生成 + 强制 `</think>`。
+
+- **缩短的不是解题路径，而是得出答案之后的冗余验证。** 在双方都答对的题上：
+  - 答案出现之前的推理：4B +20%，8B +12%。
+  - 答案出现之后的推理：4B −23%，8B −40%。
+- **被截断后，接着已有进度作答，而不是推翻重来。**
+  - 答案区的自我否定：4B 1.60 → 0.75，8B 2.28 → 0.93。
+  - 答案长度 −26% 到 −44%，被强制时的 acc 不变。
+- **（出乎预期）base 在答案区"失控"。** 被强制后写到长度上限都没给出答案：8B 0.22 → 0.11，4B 0.10 → 0.05。
+- **推理中的反思密度和自由生成时的答案长度都不变。** 训练改变的是"何时停"和"如何收尾"，不是"怎么推理"。
+- **局限**：
+  - 难题（AIME）推理长度不变。
+  - budget 太紧时，直接作答意味着补不回缺失的推理。
+
 ### 消融：8B 128 × 112（每步 128 prompt、112 步，同样 1 epoch）
 
 eval 为 32k、avg@8、budget prompt。权重已删，eval 结果保留。
@@ -214,6 +250,12 @@ eval 为 32k、avg@8、budget prompt。权重已删，eval 结果保留。
 - [x] teacher cache 改为 driver 统一写到 head（节点本地磁盘）
 - [x] 4B eval 矩阵合并成 10 个 job（原 32 个），结果写入 3 个 4B 训练 run
 - [x] 8B 8k/4k/2k、14B 8k 训练与 eval；8B（32k/16k/forced）和 14B（32k）结果按 `eval_avg8_*` 写入各自训练 run
+- [x] CRISP 实现（`opd_teacher_source: self`）：
+  - teacher 是 actor worker 里 ref 模块持有的 student 拷贝，在"CRISP 简洁指令 + student 的 response"上前向，取 final-norm hidden state，配合上次刷新时收集的完整 lm_head，算精确的全词表 reverse KL。
+  - 每 `opd_teacher_refresh_steps`（20）次更新，把 student 的参数分片拷进 teacher。
+  - 配置为 `configs/qwen3_{4b,8b,14b}_crisp.yaml`。
+  - 状态：单元测试已通过，GPU 冒烟测试待运行。
+- [x] eval variant 支持 `prompt: plain`（不加 budget prompt，供 CRISP 用），所有 plain variant 共用同一条 rollout
 
 ## 注意事项
 
