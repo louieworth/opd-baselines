@@ -23,8 +23,9 @@ wandb_entity: li-jiang-research
 h100_nnodes: 2
 n_gpus_per_node: 8
 vllm_tensor_parallel_size: 2
-# 16 trajectories/GPU/update: 2x8 GPUs => 256 prompts x 1 (or 32 x 8 with groups).
-per_device_batch_size: 16
+# Trajectories per rollout replica: with TP 2 there are 8 replicas on 2x8 GPUs, so 32 x 8 = 256 prompts
+# per update (56 steps per epoch), the same as the 4B run's 16 x 16 replicas.
+per_device_batch_size: 32
 ppo_mini_batch_size: null # one complete rollout batch, derived from the GPU count
 actor_use_dynamic_bsz: false
 ppo_micro_batch_size_per_gpu: 1
@@ -88,3 +89,9 @@ h100_runtime:
 # Budget prompt at every eval; the plain prompt (= base model) only at step 0, i.e. only runs
 # with val_before_train.
 adopd_eval_plain_prompt: initial
+# Every eval runs three variants from one 32k rollout per question: 32k as is, cut at 16k, and forced
+# (</think> after the training budget, answer generated within 16k). The first is also reported as eval/.
+adopd_eval_variants:
+- {name: 32k, limit: 32768, forced: false}
+- {name: 16k, limit: 16384, forced: false}
+- {name: forced, limit: 16384, forced: true}
