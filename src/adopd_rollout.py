@@ -117,8 +117,12 @@ def eval_agent_class():
                 limit=options['eval_max_completion_length'], forced=False)]
             messages = list(kwargs['raw_prompt'])
             plain = await self.apply_chat_template(messages)
-            prompts = {budget: await self.apply_chat_template(student_messages(messages, budget))
-                       for budget in {variant['budget'] for variant in variants}}
+            # One rollout per distinct prompt: the budget instruction for each budget, or the plain question.
+            def asking(variant):
+                return 'plain' if variant.get('prompt', 'budget') == 'plain' else variant['budget']
+            prompts = {key: plain if key == 'plain' else
+                       await self.apply_chat_template(student_messages(messages, key))
+                       for key in {asking(variant) for variant in variants}}
             halt = halt_id(self.tokenizer)
             eos = {self.tokenizer.eos_token_id, self.tokenizer.bos_token_id} - {None}
             longest = max(variant['limit'] for variant in variants)
@@ -152,7 +156,7 @@ def eval_agent_class():
             with simple_timer('generate_sequences', metrics):
                 rollouts = dict(zip(asked, await asyncio.gather(*(
                     free_rollout(self.server_manager.generate, ids, sampling_params, longest) for ids in asked.values()))))
-                jobs = [scored(prompts[v['budget']], rollouts[v['budget']], v) for v in variants]
+                jobs = [scored(prompts[asking(v)], rollouts[asking(v)], v) for v in variants]
                 if kwargs['adopd_eval_plain']:
                     jobs.append(scored(plain, rollouts['plain'], variants[0]))
                 results = await asyncio.gather(*jobs)
@@ -167,7 +171,7 @@ def eval_agent_class():
                 score.update({f'nobudget_{key}': value for key, value in plain_score.items()},
                              nobudget_response_length=len(plain_tokens))
             tokens = first_tokens[:self.response_length]
-            prompt = prompts[variants[0]['budget']]
+            prompt = prompts[asking(variants[0])]
             return AgentLoopOutput(prompt_ids=prompt, response_ids=tokens, response_mask=[1] * len(tokens),
                 reward_score=score['acc'], num_turns=1, metrics=metrics,
                 extra_fields={'reward_extra_info': score, 'turn_scores': [], 'tool_rewards': [],

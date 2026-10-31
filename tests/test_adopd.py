@@ -162,6 +162,7 @@ def test_eval_preserves_budget_without_teacher_or_cache(tmp_path, monkeypatch, m
     ('adopd_eval_variants', [{'name': 'a b', 'budget': 2, 'limit': 16384, 'forced': False}]),
     ('adopd_eval_variants', [{'name': 'x', 'budget': 2, 'limit': 9, 'forced': False}] * 2),
     ('adopd_eval_variants', [{'name': 'x', 'budget': 9, 'limit': 9, 'forced': True}]),
+    ('adopd_eval_variants', [{'name': 'x', 'limit': 9, 'forced': False, 'prompt': 'none'}]),
     ('opd_loss_token_mode', 'top_k_teacher'), ('opd_distribution_chunk_size', 0)])
 def test_invalid_options(key, value):
     with pytest.raises(ValueError):
@@ -1544,3 +1545,36 @@ def test_eval_variant_longer_than_the_rollout_server_allows_is_rejected(tmp_path
                adopd_eval_variants=[dict(name='32k', budget=4096, limit=32768, forced=False)])
     with pytest.raises(ValueError, match='val_max_completion_length'):
         compose(cfg, tmp_path, [])
+
+
+def test_plain_prompt_variants_share_one_rollout_without_the_budget_instruction(monkeypatch, budget_tokenizer):
+    import src.reward_async
+    from src.adopd_rollout import eval_agent_class
+    variants = [dict(name='32k', budget=2, limit=9, forced=False, prompt='plain'),
+                dict(name='forced_b2', budget=2, limit=7, forced=True, prompt='plain')]
+    monkeypatch.setenv('ADOPD_CONFIG', json.dumps(dict(adopd_reasoning_budget=2, enabled=True,
+                                                       eval_max_completion_length=9, adopd_eval_variants=variants)))
+    calls = []
+
+    async def generate(*, request_id, prompt_ids, sampling_params):
+        calls.append((list(prompt_ids), sampling_params['max_tokens']))
+        return SimpleNamespace(token_ids=[5, 5, 5, 5, 5, 99, 7] if sampling_params['max_tokens'] == 9 else [7])
+
+    async def apply_template(messages):
+        return budget_tokenizer.apply_chat_template(messages)
+
+    async def score(source, text, truth):
+        return {'acc': float(text == truth)}
+
+    monkeypatch.setattr(src.reward_async, 'compute_score', score)
+    agent = object.__new__(eval_agent_class())
+    agent.tokenizer, agent.response_length = budget_tokenizer, 9
+    agent.apply_chat_template = apply_template
+    agent.server_manager = SimpleNamespace(generate=generate)
+    question = [{'role': 'user', 'content': 'q'}]
+    info = asyncio.run(agent.run({'temperature': 1.0}, raw_prompt=question, adopd_eval_plain=False,
+                                 data_source='math', reward_model={'ground_truth': '7'})).extra_fields['reward_extra_info']
+    plain = budget_tokenizer.apply_chat_template(question)
+    # One rollout of the plain question; the forced variant keeps its first 2 tokens and adds only the answer.
+    assert calls == [(plain, 9), (plain + [5, 5, 99], 7 - 3)]
+    assert info['32k_acc'] == 1.0 and info['forced_b2_forced_halt'] == 1.0 and info['forced_b2_acc'] == 1.0

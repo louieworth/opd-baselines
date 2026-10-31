@@ -18,7 +18,8 @@ DEFAULTS = {
     'adopd_eval_plain_prompt': True,  # True, False, or 'initial' (only the step-0 evaluation)
     # None: one unforced evaluation at val_max_completion_length. Otherwise a list of
     # {name, budget, limit, forced}: every question runs every variant (forced: </think> at the budget).
-    # budget may be omitted: it is then the run's adopd_reasoning_budget.
+    # budget may be omitted: it is then the run's adopd_reasoning_budget. prompt: budget (default) asks with the
+    # budget instruction, plain without it (budget then only sets where a forced variant closes the trace).
     'adopd_eval_variants': None,
 }
 KEYS = tuple(DEFAULTS)
@@ -46,8 +47,10 @@ def options(config):
         # later override of adopd_reasoning_budget still reaches it.
         for variant in variants:
             if not isinstance(variant, dict) or not {'name', 'limit', 'forced'} <= set(variant) \
-                    or not set(variant) <= {'name', 'budget', 'limit', 'forced'}:
-                raise ValueError('Each eval variant needs name, limit and forced, and optionally budget')
+                    or not set(variant) <= {'name', 'budget', 'limit', 'forced', 'prompt'}:
+                raise ValueError('Each eval variant needs name, limit and forced, and optionally budget and prompt')
+            if variant.get('prompt', 'budget') not in ('budget', 'plain'):
+                raise ValueError('Eval variant prompt must be budget or plain')
             variant = dict(variant, budget=variant.get('budget', result['adopd_reasoning_budget']))
             if not isinstance(variant['name'], str) or not re.fullmatch(r'[a-z0-9_]+', variant['name']) \
                     or variant['name'] in names:
