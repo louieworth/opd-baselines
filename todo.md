@@ -1,24 +1,23 @@
 # TODO — ADOPD v2 efficient reasoning
 
-更新时间：2026-10-31 02:20 UTC。集群：2 × 8 H100（Ray head + workera），所有产物都在容器内。
+更新时间：2026-10-31 20:00 UTC。集群：2 × 8 H100（Ray head + workera），所有产物都在容器内。
 
 ## 进行中
 
-- [ ] Qwen3-8B 4k（256 × 56，训练中 eval 跑 32k/16k/forced）—— 01:38 UTC 开始，预计 ~07:00 完成
-- [ ] Qwen3-8B 2k（同上）
-- [ ] Qwen3-8B base 的 step-0 eval：3 个 budget prompt × 32k/16k/forced（`tmp/eval_merged8b/base_step0.yaml`）
-- [ ] Qwen3-14B teacher cache（teacher TP 1，16 个副本）
-- [ ] Qwen3-14B 8k：只做 32k eval，step 0 含 plain（base model）对照
+- [ ] Qwen3-14B base 的 forced `</think>` eval：budget prompt 2k / 4k / 8k，强制截断并只续写答案（同时得到 16k），avg@8 —— 19:43 UTC 开始
+- [ ] 实例分析的真实轨迹：4B base vs 4B 8k（step 56），8B base vs 8B 4k（step 56）；AMC23 / AIME25 / GPQA 物理各 3 题 × 4 个样本，自由生成（32k）+ 强制 `</think>`
+- [ ] Qwen3-14B 4k、2k（256 × 56，32k eval，step 0 不 eval）
 
-以上由 `tmp/chain_8b_14b_v2.sh` 串行执行；启动阶段失败（端口竞争）自动重试 3 次；每个 run 结束后删除 FSDP 分片、保留 HF 权重。
+以上由 `tmp/chain_14b_more.sh` 串行执行：启动阶段失败自动重试 3 次，每个 run 结束后删除 FSDP 分片、保留 HF 权重。
 
 ## 待办
 
-- [ ] 把 8B 训练中的 `eval_32k/`、`eval_16k/`、`eval_forced/` 以及 8B base 的 step-0 结果，按 `eval_avg8_*` 命名写入三个 8B run，和 4B 面板一致
-- [ ] 14B 的 32k 结果同样写成 `eval_avg8_32k/`（step 0 含 `_plain`）
-- [ ] 汇总 4B / 8B / 14B 的长度缩短与 accuracy 表，更新 Google Slides（第 21/24/25 页仍是 16k 口径）
+- [ ] **CRISP 基线**（Compressed Reasoning via Iterative Self-Policy Distillation）：沿用当前的实验参数（训练 response 16k、256 × 56），只换成它的算法形式（teacher prompt 带 shorter CoT 指令）；4B、8B、14B 各跑一遍，eval 做 32k 和强制 `</think>` 两个版本，step 0 不 eval
+- [ ] 实例分析文档：用上面的真实轨迹，分析方法为什么有效
+- [ ] 14B 4k/2k、14B base forced 的结果写入 wandb（`eval_avg8_*`），并补进本文
+- [ ] 更新 Google Slides（第 21/24/25 页仍是 16k 口径），加入 4B/8B/14B 矩阵和跨模型对比
 - [ ] 端口竞争的根治：verl 在临时端口段（32768–63999）里选 `MASTER_PORT` 后再 bind，会被其他进程抢占（`EADDRINUSE` / TCPStore 30 分钟超时）。给 worker group 传 `master_port_range`（< 32768），并保证并发创建的 group 不重叠
-- [ ] 把可复用的运维脚本从 `tmp/`（gitignored）提升到 `scripts/`：eval 矩阵生成、wandb 合并日志、FSDP 分片清理、本文的表格生成（`tmp/report_tables.py`）
+- [ ] 把可复用的运维脚本从 `tmp/`（gitignored）提升到 `scripts/`：eval 矩阵生成、wandb 合并日志、FSDP 分片清理、表格生成（`tmp/report_tables.py`）
 - [ ] 两个 `test_sbatch_reads_yaml_allocation_and_launches_all_nodes` 测试依赖 `/scratch` 路径，在本集群上一直失败
 - [ ] worker 磁盘：`/opt/tiger/refine_opsd_persist`（1.36T，非本项目）是否删除待定
 
@@ -63,6 +62,9 @@
 | 4B 4k | `5f2273ed` `qwen3_4b_adopd_v2_sample_g1_b4096` |
 | 4B 2k | `b1c97764` `qwen3_4b_adopd_v2_sample_g1_b2048` |
 | 8B 8k | `3a0ce5dd` `qwen3_8b_adopd_v2_sample_g1_b8192_bs256` |
+| 8B 4k | `155bdc61` `qwen3_8b_adopd_v2_sample_g1_b4096_bs256` |
+| 8B 2k | `78db565f` `qwen3_8b_adopd_v2_sample_g1_b2048_bs256` |
+| 14B 8k | `3c13e5bd` `qwen3_14b_adopd_v2_sample_g1_b8192_bs256` |
 
 ## 已完成实验
 
@@ -83,6 +85,12 @@
 | 4B 2k 256x56 | 52–56 | 0.750 | 3342 | 1990 | 1352 | 0.90 | 0.073 | 0.097 | 231 |
 | 8B 8k 256x56 | 1–5 | 0.722 | 9683 | 7012 | 2671 | 0.59 | 0.086 | 0.086 | 224 |
 | 8B 8k 256x56 | 52–56 | 0.890 | 7082 | 5674 | 1408 | 0.31 | 0.066 | 0.069 | 197 |
+| 8B 4k 256x56 | 1–5 | 0.710 | 8236 | 3966 | 4268 | 0.89 | 0.096 | 0.097 | 213 |
+| 8B 4k 256x56 | 52–56 | 0.869 | 5484 | 3650 | 1833 | 0.68 | 0.077 | 0.089 | 177 |
+| 8B 2k 256x56 | 1–5 | 0.691 | 7587 | 2038 | 5548 | 0.98 | 0.104 | 0.100 | 206 |
+| 8B 2k 256x56 | 52–56 | 0.814 | 4363 | 2000 | 2363 | 0.91 | 0.087 | 0.098 | 168 |
+| 14B 8k 256x56 | 1–5 | 0.770 | 8553 | 6760 | 1792 | 0.53 | 0.073 | 0.083 | 278 |
+| 14B 8k 256x56 | 52–56 | 0.922 | 6315 | 5258 | 1056 | 0.24 | 0.050 | 0.064 | 268 |
 | 8B 8k 128x112（消融） | 1–5 | 0.709 | 9955 | 7130 | 2823 | 0.62 | 0.091 | 0.087 | 168 |
 | 8B 8k 128x112（消融） | 108–112 | 0.833 | 4882 | 3758 | 1122 | 0.16 | 0.070 | 0.046 | 142 |
 | 8B 4k 128x112（消融） | 1–5 | 0.692 | 8063 | 4006 | 4056 | 0.91 | 0.096 | 0.098 | 157 |
@@ -90,7 +98,8 @@
 
 总耗时：
 - 4B 每个 run 5.1–5.8 h（中途 eval 按旧的 16k avg@4 口径跑）。
-- 8B 8k 256×56 共 4.6 h，含 3 次 32k/16k/forced eval，每次约 24 分钟。
+- 8B 每个 run 4.3–4.6 h，含 3 次 32k/16k/forced eval（每次约 24 分钟）。
+- 14B 8k 6.3 h，含 step 0（plain + budget）和 3 次 32k eval。
 
 ### Qwen3-4B eval 矩阵（acc / 平均长度）
 
@@ -110,17 +119,25 @@ base（step 0，plain，32k）：acc 0.699，长度 13,692。step 0 = base model
 
 base 的 plain 在 16k 下：acc 0.584，长度 10.9k。
 
-### Qwen3-8B 8k（256 × 56）
+### Qwen3-8B eval 矩阵（acc / 平均长度）
 
-base（step 0，32k）：plain acc 0.706 / 14,103；8k prompt acc 0.693 / 13,497。
+step 0 = base model 加对应 run 的 budget prompt（8B base 合并 eval）。
 
-| eval | step 20 | step 40 | step 56 | step 56 forced 比例 | Δlen step 56 vs base plain(32k) |
-|---|---|---|---|---|---|
-| 32k | 0.709 / 13.5k | 0.703 / 13.2k | 0.690 / 12.6k | — | -10.5% |
-| 16k | 0.588 / 10.7k | 0.593 / 10.6k | 0.602 / 10.3k | — | — |
-| forced | 0.614 / 9.4k | 0.616 / 9.2k | 0.621 / 8.9k | 0.54 | — |
+base（step 0，plain，32k）：acc 0.706，长度 14,103
 
-按数据集（32k，step 56 vs base plain）：
+| run | eval | step 0 | step 20 | step 40 | step 56 | Δlen vs base 同 prompt | Δlen vs base plain(32k) |
+|---|---|---|---|---|---|---|---|
+| 8B 8k | 32k | 0.715 / 13.6k | 0.709 / 13.5k | 0.703 / 13.2k | 0.690 / 12.6k | -7.4% | -10.5% |
+| 8B 8k | 16k | 0.581 / 10.8k | 0.588 / 10.7k | 0.593 / 10.6k | 0.602 / 10.3k | -4.8% | — |
+| 8B 8k | forced | 0.602 / 9.6k | 0.614 / 9.4k | 0.616 / 9.2k | 0.621 / 8.9k | -6.8% | — |
+| 8B 4k | 32k | 0.703 / 13.4k | 0.700 / 13.5k | 0.705 / 13.2k | 0.706 / 12.6k | -6.2% | -10.7% |
+| 8B 4k | 16k | 0.584 / 10.7k | 0.581 / 10.7k | 0.589 / 10.5k | 0.613 / 10.1k | -5.2% | — |
+| 8B 4k | forced | 0.589 / 8.1k | 0.578 / 7.8k | 0.581 / 7.5k | 0.596 / 7.2k | -10.8% | — |
+| 8B 2k | 32k | 0.707 / 13.4k | 0.700 / 13.3k | 0.699 / 13.1k | 0.704 / 12.5k | -6.3% | -11.1% |
+| 8B 2k | 16k | 0.594 / 10.6k | 0.579 / 10.6k | 0.600 / 10.4k | 0.611 / 10.1k | -4.9% | — |
+| 8B 2k | forced | 0.561 / 7.4k | 0.558 / 7.2k | 0.547 / 6.4k | 0.547 / 5.7k | -22.6% | — |
+
+8B 8k 按数据集（32k，step 56 vs base plain）：
 
 | 数据集 | base acc | step 56 acc | 长度 base | 长度 step 56 | Δlen |
 |---|---|---|---|---|---|
@@ -131,7 +148,40 @@ base（step 0，32k）：plain acc 0.706 / 14,103；8k prompt acc 0.693 / 13,497
 | gpqa_chemistry_general | 0.588 | 0.588 | 10,461 | 8,824 | -15.6% |
 | gpqa_physics_general | 0.862 | 0.809 | 8,777 | 7,116 | -18.9% |
 
-8B base 的 16k / forced 结果要等 8B base step-0 eval 跑完。
+### Qwen3-14B 8k（32k eval）
+
+| | acc | 长度 | Δlen vs base plain |
+|---|---|---|---|
+| base plain | 0.744 | 12,750 | — |
+| base 8k prompt | 0.743 | 12,073 | -5.3% |
+| step 20 | 0.743 | 12,262 | -3.8% |
+| step 40 | 0.747 | 11,984 | -6.0% |
+| step 56 | 0.738 | 11,713 | -8.1% |
+
+按数据集（32k，step 56）：
+
+| 数据集 | base plain | base 8k prompt | step 56 | Δacc vs plain | Δlen vs plain | Δlen vs 8k prompt |
+|---|---|---|---|---|---|---|
+| aime25 | 0.725 / 16,690 | 0.717 / 16,170 | 0.696 / 15,755 | -0.029 | -5.6% | -2.6% |
+| aime26 | 0.738 / 14,939 | 0.708 / 14,747 | 0.713 / 14,263 | -0.025 | -4.5% | -3.3% |
+| hmmt26 | 0.485 / 18,638 | 0.477 / 17,984 | 0.462 / 17,542 | -0.023 | -5.9% | -2.5% |
+| amc23 | 0.991 / 7,789 | 0.988 / 7,067 | 0.994 / 6,718 | +0.003 | -13.8% | -5.0% |
+| gpqa_chemistry_general | 0.675 / 8,982 | 0.731 / 7,652 | 0.713 / 7,505 | +0.037 | -16.4% | -1.9% |
+| gpqa_physics_general | 0.789 / 7,255 | 0.803 / 6,310 | 0.809 / 6,127 | +0.020 | -15.5% | -2.9% |
+
+### 跨模型对比（32k，step 56）
+
+| model | base plain acc / 长度 | budget | step 56 acc | Δacc vs plain | Δlen vs plain | Δlen vs base 同 prompt |
+|---|---|---|---|---|---|---|
+| 4B | 0.699 / 13,692 | 8k | 0.665 | -0.034 | -16.6% | -8.6% |
+| 4B | 0.699 / 13,692 | 4k | 0.672 | -0.027 | -15.4% | -1.8% |
+| 4B | 0.699 / 13,692 | 2k | 0.674 | -0.025 | -12.2% | -0.6% |
+| 8B | 0.706 / 14,103 | 8k | 0.690 | -0.016 | -10.5% | -7.4% |
+| 8B | 0.706 / 14,103 | 4k | 0.706 | +0.001 | -10.7% | -6.2% |
+| 8B | 0.706 / 14,103 | 2k | 0.704 | -0.001 | -11.1% | -6.3% |
+| 14B | 0.744 / 12,750 | 8k | 0.738 | -0.007 | -8.1% | -3.0% |
+
+4B/8B 的“同 prompt”基线来自各自 base 的合并 eval；8B base 的 8k prompt 两次 eval 分别为 13,497（128×112 run 的 step 0）和 13,620（合并 eval）。
 
 ### 消融：8B 128 × 112（每步 128 prompt、112 步，同样 1 epoch）
 
@@ -152,17 +202,18 @@ eval 为 32k、avg@8、budget prompt。权重已删，eval 结果保留。
 
 ### 目前的结论
 
-- 训练时强制截断后，学到的主要是**更短的答案**：4B 2k 的答案长度从 3150 降到 1352。forced 比例下降不多（4B 2k 从 0.97 到 0.90），说明模型没怎么学会在 budget 内自己结束思考。
-- 自由生成（32k）下的缩短，主要来自 budget prompt 本身加上 8k run 的训练：
-  - 相对 base plain：4B 8k/4k/2k 为 −16.6% / −15.4% / −12.2%，8B 8k 为 −10.5%。
-  - 相对“base + 同一 budget prompt”：只有 8k 还有明显缩短（4B −8.6%，8B −6.5%）。
-- forced eval（训练时的使用方式）下，长度缩短最明显，4B 2k 达到 −26%。代价是 accuracy 随 budget 变紧而下降：4B 2k 从 0.528 降到 0.477。8B 8k 的 forced acc 在 step 20 → 56 间反而上升（0.614 → 0.621）。
+- **模型越大，缩短越少，acc 越稳**（8k，32k eval，相对 base plain）：4B −16.6% / −3.4 pts，8B −10.5% / −1.6 pts，14B −8.1% / −0.7 pts。
+- **8B 的训练效果最“干净”**：相对“base + 同一 budget prompt”仍有 6–7% 的缩短，4k/2k 的 acc 与 base 持平；4B 只有 8k 有明显的训练增益，14B 只有 3%。
+- **16k 预算下 acc 随训练上升**（8B：+2 到 +3 pts；4B 8k：+2.2 pts），说明在 16k 内能做完的题更多。
+- **强制 `</think>` 下长度缩短最多**（4B 2k −26%，8B 2k −23%），但被强制的比例几乎不降（约 0.9）：模型学到的主要是更短的答案，而不是在 budget 内自己结束思考。
+- **缩短集中在 GPQA 和 AMC23**（14B −14% 到 −16%），AIME/HMMT 只缩 3–6%，与 budget prompt 本身的效果分布一致。
 
 ## 已完成（工程）
 
 - [x] eval variants：一条 32k rollout 同时得出 32k/16k/forced（`adopd_eval_variants`）
 - [x] teacher cache 改为 driver 统一写到 head（节点本地磁盘）
 - [x] 4B eval 矩阵合并成 10 个 job（原 32 个），结果写入 3 个 4B 训练 run
+- [x] 8B 8k/4k/2k、14B 8k 训练与 eval；8B（32k/16k/forced）和 14B（32k）结果按 `eval_avg8_*` 写入各自训练 run
 
 ## 注意事项
 
