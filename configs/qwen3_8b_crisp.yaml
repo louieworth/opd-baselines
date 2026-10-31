@@ -1,0 +1,90 @@
+# CRISP baseline (arXiv 2603.05433): on-policy self-distillation. The student (plain prompt) is pulled toward
+# itself prompted to be concise: exact full-vocabulary reverse KL on every response token, no reward, no
+# length term. The teacher is the reference copy of the student, refreshed to it every 20 updates.
+# Training budget as ADOPD v2: 256 prompts x 56 updates, 16k responses, same optimizer schedule.
+method: opd
+model_path: /opt/tiger/models/Qwen3-8B
+teacher_model_path: /opt/tiger/models/Qwen3-8B # the teacher is the student (opd_teacher_source: self)
+auto_prepare_model: false
+local_models_only: true
+mode: thinking
+project_name: efficient-reasoning
+experiment_name: qwen3_8b_crisp
+output_dir: /opt/tiger/opd-baselines/outputs/crisp # node-local; each node keeps its own FSDP shards
+use_wandb: true
+wandb_mode: online
+wandb_entity: li-jiang-research
+h100_nnodes: 2
+n_gpus_per_node: 8
+vllm_tensor_parallel_size: 2
+per_device_batch_size: 32 # 8 rollout replicas x 32 = 256 prompts per update
+group_size: 1
+ppo_mini_batch_size: 256 # one update per rollout batch
+actor_use_dynamic_bsz: false
+ppo_micro_batch_size_per_gpu: 1
+actor_max_token_len_per_gpu: 18432
+num_epochs: 1
+total_training_steps: null
+learning_rate: 1.0e-6
+warmup_steps: 25
+weight_decay: 0.01
+max_grad_norm: 1.0
+kl_loss_coef: 0.0 # the reference model is the teacher; no KL-to-reference term
+max_train_samples: 100000
+max_prompt_length: 2048
+max_completion_length: 16384
+temperature: 1.0
+top_p: 1.0
+top_k_sampling: -1
+vllm_gpu_memory_utilization: 0.4
+# CRISP's conciseness instruction (paper Fig. 3 / prompts.json), prepended to the question for the teacher only.
+teacher_prompt: "Solve the following math problem concisely and correctly. Be direct \u2014 avoid unnecessary elaboration, redundant steps, or restating the problem. Focus only on the key reasoning steps needed to reach the answer."
+teacher_max_prompt_length: 2304
+teacher_enable_thinking: true
+opd_teacher_source: self
+opd_teacher_refresh_steps: 20 # refreshed before updates 21 and 41
+# verl still starts the native teacher server, but a self-teacher never sends it requests: keep it small.
+teacher_enable_resource_pool: false
+teacher_n_gpus_per_node: 8
+teacher_tp_size: 2
+teacher_gpu_memory_utilization: 0.15
+distillation_num_workers: 8
+distillation_loss_mode: k1
+distillation_topk: 64
+distillation_use_policy_gradient: true
+distillation_use_task_rewards: false
+distillation_loss_coef: 1.0
+distillation_loss_max_clamp: 10.0 # shared OPD numerics (per-token KL cap); CRISP itself clips nothing, rarely binds
+distillation_log_prob_min_clamp: -10.0
+opd_loss_token_mode: full_vocab
+opd_token_top_k: 32
+opd_enable_metrics: false
+opd_distribution_chunk_size: 64
+train_files: /opt/tiger/opd-baselines/data/train/dapo_math_17k_en.parquet
+val_files:
+- /opt/tiger/opd-baselines/data/eval/aime25.parquet
+val_before_train: false
+eval_steps: -1 # no in-training eval: steps 20/40/56 are evaluated afterwards (plain prompt; 32k and forced)
+val_max_prompt_length: 4096
+val_max_completion_length: 16384
+val_do_sample: true
+val_n: 1
+val_temperature: 1.0
+val_top_p: 1.0
+val_top_k: -1
+val_batch_size: 200
+save_eval_generations: false
+save_steps: 20 # HF weights at 20, 40 and 56 for the evaluation
+max_checkpoints_to_keep: 1
+checkpoint_save_contents: [model, optimizer, extra, hf_model]
+h100_runtime:
+  student:
+    enforce_eager: false # CUDA graphs; needs VLLM_ATTENTION_BACKEND=FLASH_ATTN in this image
+    enable_chunked_prefill: true
+    max_num_batched_tokens: 4096
+    max_num_seqs: 128
+  teacher:
+    enforce_eager: true
+    enable_chunked_prefill: true
+    max_num_batched_tokens: 4096
+    max_num_seqs: 128

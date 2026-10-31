@@ -32,5 +32,6 @@ tests
 !/tests/test_opd_response_mask.py
 !/tests/test_opd_divergence.py
 !/tests/test_gpqa_subsets.py
+!/tests/test_crisp.py
 *.log
 .DS_Store

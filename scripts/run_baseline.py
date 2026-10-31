@@ -445,7 +445,11 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
     model_path = effective_model(cfg)
     reward_path = ROOT / "src/reward_async.py"
     kl_coef = float(cfg.get("kl_loss_coef", 0.0))
-    use_kl = kl_coef != 0.0
+    # A self-teacher (CRISP) is the reference model, which verl builds only with the KL loss on; it keeps weight kl_coef.
+    self_teacher = method == 'opd' and cfg.get('opd_teacher_source', 'vllm') == 'self'
+    if self_teacher and str(cfg['teacher_model_path']) != str(cfg['model_path']):
+        raise ValueError('A self-teacher (opd_teacher_source: self) requires teacher_model_path == model_path')
+    use_kl = kl_coef != 0.0 or self_teacher
     use_wandb = strict_bool(cfg, "use_wandb", True)
     logger = ["console", "wandb"] if use_wandb else ["console"]
     save_generations = strict_bool(cfg, "save_eval_generations", True)
