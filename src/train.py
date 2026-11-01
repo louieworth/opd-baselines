@@ -87,7 +87,8 @@ class BaselineTrainer(RayPPOTrainer):
     def _clear_teacher_features(references):
         # All DP workers and microbatches have completed. Keep only the fixed
         # output head between steps; response features otherwise grow every step.
-        if references is None:
+        # A self-teacher scores inside the actor and caches no features.
+        if references is None or runtime_options()['opd_teacher_source'] == 'self':
             return
         from src.opd_runtime import cache_root
         root = cache_root().resolve()

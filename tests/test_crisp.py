@@ -188,3 +188,15 @@ def test_crisp_recipes_pass_the_trainer_config_validation(monkeypatch, tmp_path,
     with hydra.initialize_config_dir(config_dir=str(ROOT / 'third_party/verl/verl/trainer/config'), version_base=None):
         native = hydra.compose(config_name='ppo_trainer', overrides=command[3:])
     validate_config(native, use_reference_policy=True, use_critic=False)  # what the trainer checks before building
+
+
+def test_a_finished_update_with_a_self_teacher_leaves_no_feature_files_to_clear(monkeypatch, tmp_path):
+    from src.train import BaselineTrainer
+    monkeypatch.setenv('OPD_EXTENSIONS_CONFIG', json.dumps(dict(
+        FULL_VOCAB, opd_teacher_source='self', opd_teacher_refresh_steps=20, feature_cache=str(tmp_path))))
+    head = tmp_path / 'output_head.pt'
+    head.write_bytes(b'')
+    # The self-teacher scores inside the actor, so its references name tokens, not cached feature files.
+    BaselineTrainer._clear_teacher_features([dict(prompt_length=3, response_length=4, teacher_prompt_length=1,
+                                                  teacher_input_ids=[9, 11, 12, 13, 14]), None])
+    assert head.exists()
