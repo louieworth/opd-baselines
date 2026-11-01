@@ -1,18 +1,20 @@
 # TODO — ADOPD v2 efficient reasoning
 
-更新时间：2026-11-01 07:40 UTC。集群：2 × 8 H100（Ray head + workera），所有产物都在容器内。
+更新时间：2026-11-01 14:40 UTC。集群：2 × 8 H100（Ray head + workera），所有产物都在容器内。
 
 ## 进行中
 
-- [ ] CRISP 基线（`tmp/chain_crisp.sh`，由 `tmp/chain_14b_matrix.sh` 在 14B eval 之后启动，11/01 约 07:45 UTC 开始，预计 11/02 约 11:30 UTC 结束）：
-  - 4B 冒烟测试：2 次更新，在第 2 次更新前刷新 teacher；不通过就停下。
-  - 4B → 8B → 14B 正式训练；每个 run 结束后在 step 20/40/56 做 eval（不加 budget prompt；32k，以及在 8k/4k/2k 处强制 `</think>`），然后删除 FSDP 分片。
+串联脚本 `tmp/chain_crisp_rest.sh`（11/01 12:31 UTC 起，启动阶段失败时自动重试）：
 
-两个串联脚本都在启动阶段失败时自动重试 3 次。
+- [x] CRISP 4B 训练（09:12–12:29 UTC）和 step 20/40/56 eval
+- [ ] 14B ADOPD 8k/4k/2k 在 step 20/40 的 16k/forced eval（6 个，每个约 20 分钟；8k step 20 已完成）
+- [ ] CRISP 8B → 14B：训练，step 20/40/56 eval（不加 budget prompt；一条 32k rollout 得出 32k、16k 截断和在 8k/4k/2k 处强制 `</think>`），然后删除 FSDP 分片。预计 11/02 上午到中午（UTC）全部结束。
+
+`tmp/keep_hf.py` 在后台把每个 CRISP run 的 step 20/40 HF 权重硬链接到 `hf_keep/stepN` 并拷到 head（保险，见注意事项）。
 
 ## 待办
 
-- [ ] CRISP 的 eval 结果写入各自训练 run 的 wandb（`eval_avg8_32k/`、`eval_avg8_forced_b*/`），并补进本文
+- [ ] CRISP 8B/14B 的 eval 结果写入各自训练 run 的 wandb（`tmp/log_eval_crisp_to_wandb.py`），并补进本文；4B 已完成
 - [ ] 更新 Google Slides（第 21/24/25 页仍是 16k 口径），加入 4B/8B/14B 矩阵、跨模型对比、base forced 对比和实例分析
 - [ ] 端口竞争的根治：verl 在临时端口段（32768–63999）里选 `MASTER_PORT` 后再 bind，会被其他进程抢占（`EADDRINUSE` / TCPStore 30 分钟超时）。给 worker group 传 `master_port_range`（< 32768），并保证并发创建的 group 不重叠
 - [ ] 把可复用的运维脚本从 `tmp/`（gitignored）提升到 `scripts/`：eval 矩阵生成、wandb 合并日志、FSDP 分片清理、表格生成（`tmp/report_tables.py`）、实例分析（`tmp/case_study/`）
@@ -65,6 +67,7 @@
 | 14B 8k | `3c13e5bd` `qwen3_14b_adopd_v2_sample_g1_b8192_bs256` |
 | 14B 4k | `ca52e83d` `qwen3_14b_adopd_v2_sample_g1_b4096_bs256` |
 | 14B 2k | `cb163dc9` `qwen3_14b_adopd_v2_sample_g1_b2048_bs256` |
+| CRISP 4B | `ff568aef` `qwen3_4b_crisp` |
 
 ## 已完成实验
 
@@ -156,7 +159,7 @@ base（step 0，plain，32k）：acc 0.706，长度 14,103
 ### Qwen3-14B eval 矩阵（acc / 平均长度）
 
 - 32k：训练中的 eval。
-- 16k / forced：第 56 步的合并 eval（`tmp/eval_merged14b/`）；14B 只保留最后一个 checkpoint，所以没有 step 20/40。
+- 16k / forced：合并 eval（`tmp/eval_merged14b/`）。之前写“14B 只保留最后一个 checkpoint，所以没有 step 20/40”是错的：verl 只删除 head 上的旧 checkpoint，worker 上 step 20/40 的 HF 权重都在。step 20/40 正在补跑（“—” 为尚未完成）。
 - step 0 = base model 加对应 run 的 budget prompt；4k/2k prompt 下没有跑 base 的 32k。
 
 base（step 0，plain，32k）：acc 0.744，长度 12,750
@@ -164,8 +167,8 @@ base（step 0，plain，32k）：acc 0.744，长度 12,750
 | run | eval | step 0 | step 20 | step 40 | step 56 | Δlen vs base 同 prompt | Δlen vs base plain(32k) |
 |---|---|---|---|---|---|---|---|
 | 14B 8k | 32k | 0.743 / 12.1k | 0.743 / 12.3k | 0.747 / 12.0k | 0.738 / 11.7k | -3.0% | -8.1% |
-| 14B 8k | 16k | 0.653 / 10.1k | — | — | 0.655 / 9.6k | -4.2% | — |
-| 14B 8k | forced | 0.664 / 8.2k | — | — | 0.650 / 7.7k | -5.0% | — |
+| 14B 8k | 16k | 0.653 / 10.1k | 0.650 / 10.0k | — | 0.655 / 9.6k | -4.2% | — |
+| 14B 8k | forced | 0.664 / 8.2k | 0.659 / 8.2k | — | 0.650 / 7.7k | -5.0% | — |
 | 14B 4k | 32k | — | 0.749 / 11.8k | 0.743 / 11.8k | 0.743 / 11.7k | — | -8.1% |
 | 14B 4k | 16k | 0.649 / 10.0k | — | — | 0.649 / 9.7k | -2.3% | — |
 | 14B 4k | forced | 0.605 / 6.2k | — | — | 0.574 / 5.4k | -14.1% | — |
@@ -215,6 +218,48 @@ forced 的推理 / 答案长度（step 0 → 56）：
 | amc23 | 0.991 / 7,789 | 0.988 / 7,067 | 0.994 / 6,718 | +0.003 | -13.8% | -5.0% |
 | gpqa_chemistry_general | 0.675 / 8,982 | 0.731 / 7,652 | 0.713 / 7,505 | +0.037 | -16.4% | -1.9% |
 | gpqa_physics_general | 0.789 / 7,255 | 0.803 / 6,310 | 0.809 / 6,127 | +0.020 | -15.5% | -2.9% |
+
+### CRISP 基线（arXiv 2603.05433）
+
+- 方法：自蒸馏 OPD。teacher 是 student 自身的拷贝，在 student 自己的 rollout 前加上 CRISP 的简洁指令（"Solve the following math problem concisely and correctly. Be direct — …"）后打分；loss 是全词表 reverse KL。teacher 每 20 次更新刷新为当前 student（第 21、41 次更新前）。
+- 训练设置与 ADOPD 相同（256 × 56，16k，lr 1e-6，warmup 25）；student 不加 budget prompt，也不强制 `</think>`。
+- eval：不加 budget prompt，一条 32k rollout 得出 32k、16k 截断和在 8k/4k/2k 处强制 `</think>`（只续写答案）。从 4B 起保存逐条生成，其它截断可以在 CPU 上重算。
+
+训练指标（5 步平均）：
+
+| run | steps | train acc | resp len | self-distill KL | s/step |
+|---|---|---|---|---|---|
+| CRISP 4B | 1–5 | 0.730 | 10984 | 0.0094 | 275 |
+| CRISP 4B | 18–22 | 0.783 | 9425 | 0.0070 | 216 |
+| CRISP 4B | 38–42 | 0.911 | 4571 | 0.0112 | 154 |
+| CRISP 4B | 52–56 | 0.864 | 3185 | 0.0066 | 132 |
+
+eval（acc / 平均长度）：
+
+| run | eval | step 20 | step 40 | step 56 | step 56 被强制比例 | Δacc / Δlen step 56 vs base plain(32k) |
+|---|---|---|---|---|---|---|
+| CRISP 4B | 32k | 0.682 / 12.2k | 0.641 / 8.7k | 0.597 / 5.8k | — | -0.102 / -57.5% |
+| CRISP 4B | 16k | 0.586 / 10.2k | 0.617 / 8.1k | 0.596 / 5.8k | — | — |
+| CRISP 4B | forced_b8192 | 0.605 / 9.1k | 0.615 / 7.2k | 0.582 / 5.2k | 0.25 | — |
+| CRISP 4B | forced_b4096 | 0.598 / 8.1k | 0.591 / 6.0k | 0.549 / 4.1k | 0.51 | — |
+| CRISP 4B | forced_b2048 | 0.576 / 8.0k | 0.577 / 5.6k | 0.498 / 3.5k | 0.74 | — |
+
+CRISP 4B 按数据集（32k，step 56 vs base plain）：
+
+| 数据集 | base plain | CRISP step 56 | Δacc | Δlen |
+|---|---|---|---|---|
+| aime25 | 0.646 / 17,670 | 0.463 / 8,301 | -0.183 | -53.0% |
+| aime26 | 0.683 / 15,926 | 0.567 / 7,133 | -0.117 | -55.2% |
+| hmmt26 | 0.413 / 19,280 | 0.314 / 7,934 | -0.098 | -58.8% |
+| amc23 | 0.969 / 8,619 | 0.919 / 3,181 | -0.050 | -63.1% |
+| gpqa_chemistry_general | 0.569 / 10,299 | 0.562 / 3,938 | -0.006 | -61.8% |
+| gpqa_physics_general | 0.875 / 8,433 | 0.704 / 3,678 | -0.171 | -56.4% |
+
+- CRISP 压缩得远比 ADOPD 狠：4B 32k 下 −57.5% 长度、−10.2 pts acc（ADOPD 4B 为 −12% 到 −17%、−2.5 到 −3.4 pts）。缩短主要发生在第一次 teacher 刷新之后（step 20 → 40：训练 rollout 9.4k → 4.6k）。
+- 到 step 56 几乎所有回答都在 16k 内结束（16k acc 0.596 ≈ 32k 0.597）。
+- 和 ADOPD 不同，CRISP 学会了在 budget 内自己结束思考：8k 处被强制的比例 0.53 → 0.25（step 20 → 56）。ADOPD 下这个比例基本不变，缩短的是答案。
+- acc 损失集中在难题和 GPQA 物理（AIME25 −18 pts、GPQA 物理 −17 pts）；GPQA 化学几乎不掉。
+- forced 列不能直接和上面 base forced 表比：那里 base 用的是 budget prompt，这里是 plain prompt（被强制后答案更长）。
 
 ### 跨模型对比（32k，step 56）
 
@@ -293,6 +338,7 @@ eval 为 32k、avg@8、budget prompt。权重已删，eval 结果保留。
 - **16k 预算下 acc 随训练上升**（8B：+2 到 +3 pts；4B 8k：+2.2 pts），说明在 16k 内能做完的题更多。
 - **强制 `</think>` 下长度缩短最多**（4B 2k −26%，8B 2k −23%，14B 2k −25%），但被强制的比例几乎不降（约 0.9）：模型学到的主要是更短的答案，而不是在 budget 内自己结束思考。
 - **缩短集中在 GPQA 和 AMC23**（14B −14% 到 −16%），AIME/HMMT 只缩 3–6%，与 budget prompt 本身的效果分布一致。
+- **CRISP（4B）压缩更狠、代价更大**：−57.5% 长度、−10.2 pts acc；ADOPD 4B 在 −12% 到 −17% 长度下只掉 2.5–3.4 pts。CRISP 会在 budget 内自己结束思考，ADOPD 缩短的主要是答案。
 
 ## 已完成（工程）
 
@@ -304,11 +350,15 @@ eval 为 32k、avg@8、budget prompt。权重已删，eval 结果保留。
   - teacher 是 actor worker 里 ref 模块持有的 student 拷贝，在"CRISP 简洁指令 + student 的 response"上前向，取 final-norm hidden state，配合上次刷新时收集的完整 lm_head，算精确的全词表 reverse KL。
   - 每 `opd_teacher_refresh_steps`（20）次更新，把 student 的参数分片拷进 teacher。
   - 配置为 `configs/qwen3_{4b,8b,14b}_crisp.yaml`。
-  - 状态：单元测试已通过，GPU 冒烟测试待运行。
+  - 状态：GPU 上跑通（4B 冒烟 2 次更新 + 4B 正式 56 步）。修了两个只在 GPU 上暴露的问题：ref 模型缺少 `log_prob_micro_batch_size_per_gpu`（verl 配置校验），以及更新后清理 teacher 特征文件时 self-teacher 没有文件（`KeyError: 'path'`）。
+  - verl 在 `use_kl_loss` 下每步额外做一次 ref log-prob 前向（4B 约 8 秒/步，KL 系数为 0，不影响 loss）。
 - [x] eval variant 支持 `prompt: plain`（不加 budget prompt，供 CRISP 用），所有 plain variant 共用同一条 rollout
+- [x] 16k 不需要 GPU：unforced variant 只是把同一条 rollout 截断后在 CPU 上打分；GPU 只用于 rollout 本身和 forced 的答案续写
 
 ## 注意事项
 
 - 8B/14B 每个 rollout 副本占 2 张卡（TP 2），需要 `per_device_batch_size: 32` 才能和 4B 一样每步 256 prompt。
 - 训练长度 16k、eval 长度 32k：verl 只把 eval response pad 到训练长度、不截断，所以 eval agent 返回截断后的 response，长度指标用完整 rollout 长度。
 - wandb 里另有 5 个旧的 avg@4 eval-only run 和 1 个中止的 run，按要求保留未删。
+- verl 的 `max_checkpoints_to_keep` 只删除 head 上的旧 checkpoint；worker（FSDP rank 0、HF 导出所在节点）保留每个 `global_step_N`，直到分片被清理。
+- 停一个 run 时要连 `python3 -m src.train` 一起停：只停 `run_baseline.py` 的话驱动进程继续运行，Ray placement group 一直占着 GPU，后面等 16 张卡空闲的脚本会卡住。
