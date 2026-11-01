@@ -1,20 +1,27 @@
 # TODO — ADOPD v2 efficient reasoning
 
-更新时间：2026-11-01 14:40 UTC。集群：2 × 8 H100（Ray head + workera），所有产物都在容器内。
+更新时间：2026-11-01 16:50 UTC。两台机器，各为 2 × 8 H100（Ray head + workera），所有产物都在各自容器内：
+1101（本机，原有实验）和 1102（11/01 起，环境与 1101 相同）。`todo.md` 由 1101 统一维护，1102 的结果发给 1101 后合并进来。
 
 ## 进行中
 
-串联脚本 `tmp/chain_crisp_rest.sh`（11/01 12:31 UTC 起，启动阶段失败时自动重试）：
+**1101**（`tmp/chain_crisp_8b_only.sh`，替换了 `tmp/chain_crisp_rest.sh`）：
 
 - [x] CRISP 4B 训练（09:12–12:29 UTC）和 step 20/40/56 eval
-- [ ] 14B ADOPD 8k/4k/2k 在 step 20/40 的 16k/forced eval（6 个，每个约 20 分钟；8k step 20 已完成）
-- [ ] CRISP 8B → 14B：训练，step 20/40/56 eval（不加 budget prompt；一条 32k rollout 得出 32k、16k 截断和在 8k/4k/2k 处强制 `</think>`），然后删除 FSDP 分片。预计 11/02 上午到中午（UTC）全部结束。
+- [x] 14B ADOPD 8k/4k/2k 在 step 20/40 的 16k/forced eval（6 个，13:50–15:54 UTC），已写入 wandb
+- [ ] CRISP 8B：训练（15:55 UTC 开始），然后 step 20/40/56 eval（不加 budget prompt；一条 32k rollout 得出 32k、16k 截断和在 8k/4k/2k 处强制 `</think>`），然后删除 FSDP 分片。预计 21:30 UTC 左右结束，之后 1101 空闲，等待新任务。
+
+**1102**（`tmp/chain_1102.sh`，用户决定把 CRISP 14B 放到 1102）：
+
+- [ ] CRISP 14B：训练（wandb run `qwen3_14b_crisp`，从 1102 发出），step 20/40/56 eval，删除 FSDP 分片
+- [ ] 14B base 在 4k/2k budget prompt 下的 32k eval（补 14B 矩阵 step 0 的两格空白；结果先存在 1102 本地）
 
 `tmp/keep_hf.py` 在后台把每个 CRISP run 的 step 20/40 HF 权重硬链接到 `hf_keep/stepN` 并拷到 head（保险，见注意事项）。
 
 ## 待办
 
-- [ ] CRISP 8B/14B 的 eval 结果写入各自训练 run 的 wandb（`tmp/log_eval_crisp_to_wandb.py`），并补进本文；4B 已完成
+- [ ] CRISP 8B 的 eval 结果写入 wandb（`tmp/log_eval_crisp_to_wandb.py`），并补进本文；4B 已完成
+- [ ] 合并 1102 的结果：CRISP 14B、14B base 在 4k/2k prompt 下的 32k eval
 - [ ] 更新 Google Slides（第 21/24/25 页仍是 16k 口径），加入 4B/8B/14B 矩阵、跨模型对比、base forced 对比和实例分析
 - [ ] 端口竞争的根治：verl 在临时端口段（32768–63999）里选 `MASTER_PORT` 后再 bind，会被其他进程抢占（`EADDRINUSE` / TCPStore 30 分钟超时）。给 worker group 传 `master_port_range`（< 32768），并保证并发创建的 group 不重叠
 - [ ] 把可复用的运维脚本从 `tmp/`（gitignored）提升到 `scripts/`：eval 矩阵生成、wandb 合并日志、FSDP 分片清理、表格生成（`tmp/report_tables.py`）、实例分析（`tmp/case_study/`）
@@ -159,22 +166,22 @@ base（step 0，plain，32k）：acc 0.706，长度 14,103
 ### Qwen3-14B eval 矩阵（acc / 平均长度）
 
 - 32k：训练中的 eval。
-- 16k / forced：合并 eval（`tmp/eval_merged14b/`）。之前写“14B 只保留最后一个 checkpoint，所以没有 step 20/40”是错的：verl 只删除 head 上的旧 checkpoint，worker 上 step 20/40 的 HF 权重都在。step 20/40 正在补跑（“—” 为尚未完成）。
-- step 0 = base model 加对应 run 的 budget prompt；4k/2k prompt 下没有跑 base 的 32k。
+- 16k / forced：合并 eval（`tmp/eval_merged14b/`）。之前写“14B 只保留最后一个 checkpoint，所以没有 step 20/40”是错的：verl 只删除 head 上的旧 checkpoint，worker 上 step 20/40 的 HF 权重都在。step 20/40 已补齐。
+- step 0 = base model 加对应 run 的 budget prompt；4k/2k prompt 下 base 的 32k 还没跑，由 1102 补跑。
 
 base（step 0，plain，32k）：acc 0.744，长度 12,750
 
 | run | eval | step 0 | step 20 | step 40 | step 56 | Δlen vs base 同 prompt | Δlen vs base plain(32k) |
 |---|---|---|---|---|---|---|---|
 | 14B 8k | 32k | 0.743 / 12.1k | 0.743 / 12.3k | 0.747 / 12.0k | 0.738 / 11.7k | -3.0% | -8.1% |
-| 14B 8k | 16k | 0.653 / 10.1k | 0.650 / 10.0k | — | 0.655 / 9.6k | -4.2% | — |
-| 14B 8k | forced | 0.664 / 8.2k | 0.659 / 8.2k | — | 0.650 / 7.7k | -5.0% | — |
+| 14B 8k | 16k | 0.653 / 10.1k | 0.650 / 10.0k | 0.645 / 9.9k | 0.655 / 9.6k | -4.2% | — |
+| 14B 8k | forced | 0.664 / 8.2k | 0.659 / 8.2k | 0.655 / 8.1k | 0.650 / 7.7k | -5.0% | — |
 | 14B 4k | 32k | — | 0.749 / 11.8k | 0.743 / 11.8k | 0.743 / 11.7k | — | -8.1% |
-| 14B 4k | 16k | 0.649 / 10.0k | — | — | 0.649 / 9.7k | -2.3% | — |
-| 14B 4k | forced | 0.605 / 6.2k | — | — | 0.574 / 5.4k | -14.1% | — |
+| 14B 4k | 16k | 0.649 / 10.0k | 0.645 / 9.9k | 0.639 / 9.9k | 0.649 / 9.7k | -2.3% | — |
+| 14B 4k | forced | 0.605 / 6.2k | 0.605 / 5.9k | 0.584 / 5.6k | 0.574 / 5.4k | -14.1% | — |
 | 14B 2k | 32k | — | 0.738 / 11.7k | 0.746 / 11.6k | 0.746 / 11.4k | — | -10.8% |
-| 14B 2k | 16k | 0.640 / 9.8k | — | — | 0.644 / 9.6k | -1.6% | — |
-| 14B 2k | forced | 0.549 / 4.8k | — | — | 0.514 / 3.6k | -25.1% | — |
+| 14B 2k | 16k | 0.640 / 9.8k | 0.648 / 9.7k | 0.652 / 9.7k | 0.644 / 9.6k | -1.6% | — |
+| 14B 2k | forced | 0.549 / 4.8k | 0.556 / 4.8k | 0.514 / 4.0k | 0.514 / 3.6k | -25.1% | — |
 
 forced 的推理 / 答案长度（step 0 → 56）：
 
@@ -184,7 +191,8 @@ forced 的推理 / 答案长度（step 0 → 56）：
 | 14B 4k | 0.76 → 0.74 | 3,731 → 3,694 | 2,511 → 1,666 | 0.605 → 0.574 |
 | 14B 2k | 0.91 → 0.90 | 1,994 → 1,986 | 2,802 → 1,607 | 0.549 → 0.514 |
 
-- 32k 和 16k 下 acc 与 base 持平（±0.7 pts），长度在 32k 下减 8–11%（相对 base plain），16k 下减 1.6–4.2%（相对 base 同 prompt）。
+- 32k 和 16k 下 acc 与 base 持平（±0.7 pts），长度在 32k 下减 8–11%（相对 base plain），16k 下减 1.6–4.2%（相对 base 同 prompt）。16k 下整个训练过程中 acc 都在 base ±1.2 pts 以内。
+- forced 下 acc 的下降集中在 step 20 → 40（4k −2.1 pts，2k −4.2 pts），step 40 → 56 基本不再掉，长度继续缩短；step 20 时三个 budget 都和 base 持平。
 - forced 下长度减得最多（2k −25%），几乎全部来自 `</think>` 之后的答案变短（2,802 → 1,607），被强制的比例基本不变；acc 跟着降 1.4–3.5 pts。推测 base 在 `</think>` 之后的继续推理对 acc 有帮助，训练把它砍掉了。8B 在 8k/4k 的 forced 下 acc 反而上升（+1.9 / +0.7 pts），只有 2k 下降（−1.4 pts）。
 
 各数据集，32k step 56 相对 base plain（Δacc / Δlen）：
