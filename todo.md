@@ -1,26 +1,25 @@
 # TODO — ADOPD v2 efficient reasoning
 
-更新时间：2026-11-01 16:50 UTC。两台机器，各为 2 × 8 H100（Ray head + workera），所有产物都在各自容器内：
+更新时间：2026-11-01 21:00 UTC。两台机器，各为 2 × 8 H100（Ray head + workera），所有产物都在各自容器内：
 1101（本机，原有实验）和 1102（11/01 起，环境与 1101 相同）。`todo.md` 由 1101 统一维护，1102 的结果发给 1101 后合并进来。
 
 ## 进行中
 
-**1101**（`tmp/chain_crisp_8b_only.sh`，替换了 `tmp/chain_crisp_rest.sh`）：
+**1101**：11/01 20:50 UTC 起空闲，等待新任务。
 
 - [x] CRISP 4B 训练（09:12–12:29 UTC）和 step 20/40/56 eval
 - [x] 14B ADOPD 8k/4k/2k 在 step 20/40 的 16k/forced eval（6 个，13:50–15:54 UTC），已写入 wandb
-- [ ] CRISP 8B：训练（15:55 UTC 开始），然后 step 20/40/56 eval（不加 budget prompt；一条 32k rollout 得出 32k、16k 截断和在 8k/4k/2k 处强制 `</think>`），然后删除 FSDP 分片。预计 21:30 UTC 左右结束，之后 1101 空闲，等待新任务。
+- [x] CRISP 8B 训练（15:55–19:33 UTC）和 step 20/40/56 eval（19:36–20:49 UTC），已写入 wandb；FSDP 分片已删除
 
 **1102**（`tmp/chain_1102.sh`，用户决定把 CRISP 14B 放到 1102）：
 
 - [ ] CRISP 14B：训练（wandb run `qwen3_14b_crisp`，从 1102 发出），step 20/40/56 eval，删除 FSDP 分片
 - [ ] 14B base 在 4k/2k budget prompt 下的 32k eval（补 14B 矩阵 step 0 的两格空白；结果先存在 1102 本地）
 
-`tmp/keep_hf.py` 在后台把每个 CRISP run 的 step 20/40 HF 权重硬链接到 `hf_keep/stepN` 并拷到 head（保险，见注意事项）。
+CRISP 8B 的 step 20/40/56 HF 权重另有一份备份在 1102（同路径，sha256 已核对）。
 
 ## 待办
 
-- [ ] CRISP 8B 的 eval 结果写入 wandb（`tmp/log_eval_crisp_to_wandb.py`），并补进本文；4B 已完成
 - [ ] 合并 1102 的结果：CRISP 14B、14B base 在 4k/2k prompt 下的 32k eval
 - [ ] 更新 Google Slides（第 21/24/25 页仍是 16k 口径），加入 4B/8B/14B 矩阵、跨模型对比、base forced 对比和实例分析
 - [ ] 端口竞争的根治：verl 在临时端口段（32768–63999）里选 `MASTER_PORT` 后再 bind，会被其他进程抢占（`EADDRINUSE` / TCPStore 30 分钟超时）。给 worker group 传 `master_port_range`（< 32768），并保证并发创建的 group 不重叠
@@ -75,6 +74,7 @@
 | 14B 4k | `ca52e83d` `qwen3_14b_adopd_v2_sample_g1_b4096_bs256` |
 | 14B 2k | `cb163dc9` `qwen3_14b_adopd_v2_sample_g1_b2048_bs256` |
 | CRISP 4B | `ff568aef` `qwen3_4b_crisp` |
+| CRISP 8B | `e5d3ed1a` `qwen3_8b_crisp` |
 
 ## 已完成实验
 
@@ -241,6 +241,10 @@ forced 的推理 / 答案长度（step 0 → 56）：
 | CRISP 4B | 18–22 | 0.783 | 9425 | 0.0070 | 216 |
 | CRISP 4B | 38–42 | 0.911 | 4571 | 0.0112 | 154 |
 | CRISP 4B | 52–56 | 0.864 | 3185 | 0.0066 | 132 |
+| CRISP 8B | 1–5 | 0.716 | 11285 | 0.0084 | 300 |
+| CRISP 8B | 18–22 | 0.795 | 10014 | 0.0066 | 258 |
+| CRISP 8B | 38–42 | 0.922 | 4740 | 0.0111 | 181 |
+| CRISP 8B | 52–56 | 0.893 | 3414 | 0.0057 | 149 |
 
 eval（acc / 平均长度）：
 
@@ -251,23 +255,55 @@ eval（acc / 平均长度）：
 | CRISP 4B | forced_b8192 | 0.605 / 9.1k | 0.615 / 7.2k | 0.582 / 5.2k | 0.25 | — |
 | CRISP 4B | forced_b4096 | 0.598 / 8.1k | 0.591 / 6.0k | 0.549 / 4.1k | 0.51 | — |
 | CRISP 4B | forced_b2048 | 0.576 / 8.0k | 0.577 / 5.6k | 0.498 / 3.5k | 0.74 | — |
+| CRISP 8B | 32k | 0.714 / 12.8k | 0.671 / 9.2k | 0.619 / 6.3k | — | -0.086 / -55.6% |
+| CRISP 8B | 16k | 0.607 / 10.5k | 0.640 / 8.3k | 0.614 / 6.1k | — | — |
+| CRISP 8B | forced_b8192 | 0.631 / 9.4k | 0.630 / 7.4k | 0.605 / 5.5k | 0.27 | — |
+| CRISP 8B | forced_b4096 | 0.610 / 8.3k | 0.612 / 6.4k | 0.584 / 4.4k | 0.49 | — |
+| CRISP 8B | forced_b2048 | 0.591 / 8.0k | 0.584 / 5.6k | 0.535 / 3.6k | 0.72 | — |
 
-CRISP 4B 按数据集（32k，step 56 vs base plain）：
+#### ADOPD vs CRISP：相同训练量（256 × 56）下的最终模型
 
-| 数据集 | base plain | CRISP step 56 | Δacc | Δlen |
+比较口径：准确率优先；两者都按各自的设定评测（ADOPD 用 budget prompt，CRISP 用 plain prompt），比较 step 56 的最终模型。表中为相对 base plain 32k 的 Δacc（pts）/ Δlen。
+
+4B（base plain 0.699 / 13,692）：
+
+| 数据集 | ADOPD 8k | ADOPD 4k | ADOPD 2k | CRISP |
 |---|---|---|---|---|
-| aime25 | 0.646 / 17,670 | 0.463 / 8,301 | -0.183 | -53.0% |
-| aime26 | 0.683 / 15,926 | 0.567 / 7,133 | -0.117 | -55.2% |
-| hmmt26 | 0.413 / 19,280 | 0.314 / 7,934 | -0.098 | -58.8% |
-| amc23 | 0.969 / 8,619 | 0.919 / 3,181 | -0.050 | -63.1% |
-| gpqa_chemistry_general | 0.569 / 10,299 | 0.562 / 3,938 | -0.006 | -61.8% |
-| gpqa_physics_general | 0.875 / 8,433 | 0.704 / 3,678 | -0.171 | -56.4% |
+| AIME25 | -1.7 / -10% | +0.0 / -11% | +0.0 / -7% | -18.3 / -53% |
+| AIME26 | -6.2 / -12% | -4.6 / -12% | -1.7 / -10% | -11.7 / -55% |
+| HMMT26 | -4.2 / -15% | -1.9 / -11% | -2.7 / -9% | -9.8 / -59% |
+| AMC23 | -1.2 / -23% | -2.2 / -22% | -2.5 / -18% | -5.0 / -63% |
+| GPQA-化学 | -2.5 / -27% | -2.5 / -26% | -1.2 / -22% | -0.6 / -62% |
+| GPQA-物理 | -5.9 / -29% | -6.6 / -30% | -8.6 / -26% | -17.1 / -56% |
+| 加权平均 | -3.4 / -17% | -2.7 / -15% | -2.5 / -12% | -10.2 / -58% |
 
-- CRISP 压缩得远比 ADOPD 狠：4B 32k 下 −57.5% 长度、−10.2 pts acc（ADOPD 4B 为 −12% 到 −17%、−2.5 到 −3.4 pts）。缩短主要发生在第一次 teacher 刷新之后（step 20 → 40：训练 rollout 9.4k → 4.6k）。
-- 到 step 56 几乎所有回答都在 16k 内结束（16k acc 0.596 ≈ 32k 0.597）。
-- 和 ADOPD 不同，CRISP 学会了在 budget 内自己结束思考：8k 处被强制的比例 0.53 → 0.25（step 20 → 56）。ADOPD 下这个比例基本不变，缩短的是答案。
-- acc 损失集中在难题和 GPQA 物理（AIME25 −18 pts、GPQA 物理 −17 pts）；GPQA 化学几乎不掉。
-- forced 列不能直接和上面 base forced 表比：那里 base 用的是 budget prompt，这里是 plain prompt（被强制后答案更长）。
+8B（base plain 0.706 / 14,103）：
+
+| 数据集 | ADOPD 8k | ADOPD 4k | ADOPD 2k | CRISP |
+|---|---|---|---|---|
+| AIME25 | +1.2 / -10% | +2.1 / -5% | +1.7 / -6% | -15.8 / -52% |
+| AIME26 | -5.4 / -9% | -3.8 / -8% | -3.8 / -8% | -14.6 / -50% |
+| HMMT26 | +3.8 / -9% | +3.8 / -10% | +5.3 / -8% | -5.3 / -57% |
+| AMC23 | -4.4 / -9% | -3.1 / -9% | -1.2 / -15% | -4.7 / -61% |
+| GPQA-化学 | +0.0 / -16% | +6.2 / -23% | +0.0 / -22% | -1.3 / -58% |
+| GPQA-物理 | -5.3 / -19% | -3.3 / -25% | -4.6 / -26% | -9.9 / -61% |
+| 加权平均 | -1.6 / -11% | +0.1 / -11% | -0.1 / -11% | -8.6 / -56% |
+
+32k acc 随训练的变化：
+
+| run | step 20 | step 40 | step 56 |
+|---|---|---|---|
+| 4B ADOPD 8k / 4k / 2k | 0.677 / 0.677 / 0.687 | 0.677 / 0.680 / 0.680 | 0.665 / 0.672 / 0.674 |
+| 4B CRISP | 0.682 | 0.641 | 0.597 |
+| 8B ADOPD 8k / 4k / 2k | 0.709 / 0.700 / 0.700 | 0.703 / 0.705 / 0.699 | 0.690 / 0.706 / 0.704 |
+| 8B CRISP | 0.714 | 0.671 | 0.619 |
+
+- **准确率优先时，ADOPD 的最终模型明显更好**：8B 的 4k/2k 在 −11% 长度下 acc 持平（+0.1 / −0.1 pts），CRISP −8.6 pts；4B ADOPD −2.5 到 −3.4 pts，CRISP −10.2 pts。
+- **难题上 ADOPD 几乎不掉**：AIME25 4B 4k/2k +0.0，8B +1.2 到 +2.1，HMMT26 8B +3.8 到 +5.3；这些题很难再缩短（ADOPD 只缩 5–15%）。CRISP 在 AIME 上缩 50% 以上，acc 掉 12–18 pts。
+- **ADOPD 训练稳定，CRISP 一路下降**：ADOPD 的 acc 在 step 20/40/56 基本不变，不需要挑停止点；CRISP 的 acc 随 teacher 刷新逐步下降（8B 0.714 → 0.671 → 0.619）。CRISP 的 step 20 能做到 acc 不掉（8B +0.8 pts / −9%），但要在 eval 集上挑停止点。
+- **CRISP 更会在 budget 内结束思考**：8k 处被强制的比例 4B 0.53 → 0.25、8B 0.56 → 0.27（step 20 → 56），ADOPD 下这个比例基本不变；4B 在同一 budget 强制 `</think>` 时，CRISP 在多数数据集上 acc 更高。
+- 每个数据集只有 19–40 题，单格 3–5 pts 以内的差异可能是噪声。
+- CRISP 的 forced 列不能直接和 base forced 表比：那里 base 用 budget prompt，这里是 plain prompt。
 
 ### 跨模型对比（32k，step 56）
 
@@ -346,7 +382,7 @@ eval 为 32k、avg@8、budget prompt。权重已删，eval 结果保留。
 - **16k 预算下 acc 随训练上升**（8B：+2 到 +3 pts；4B 8k：+2.2 pts），说明在 16k 内能做完的题更多。
 - **强制 `</think>` 下长度缩短最多**（4B 2k −26%，8B 2k −23%，14B 2k −25%），但被强制的比例几乎不降（约 0.9）：模型学到的主要是更短的答案，而不是在 budget 内自己结束思考。
 - **缩短集中在 GPQA 和 AMC23**（14B −14% 到 −16%），AIME/HMMT 只缩 3–6%，与 budget prompt 本身的效果分布一致。
-- **CRISP（4B）压缩更狠、代价更大**：−57.5% 长度、−10.2 pts acc；ADOPD 4B 在 −12% 到 −17% 长度下只掉 2.5–3.4 pts。CRISP 会在 budget 内自己结束思考，ADOPD 缩短的主要是答案。
+- **相同训练量下，准确率优先时 ADOPD 优于 CRISP**：8B ADOPD 4k/2k −11% 长度、acc 持平；CRISP 4B/8B 缩短 56–58%，acc 掉 10.2 / 8.6 pts，AIME 上掉 12–18 pts。ADOPD 训练过程中 acc 稳定，CRISP 随训练一路下降，要用它只能在 eval 集上挑停止点。CRISP 的长处是学会在 budget 内结束思考。
 
 ## 已完成（工程）
 
