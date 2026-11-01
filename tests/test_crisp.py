@@ -177,3 +177,14 @@ def test_self_teacher_must_be_the_student_model(monkeypatch, tmp_path):
     cfg['teacher_model_path'] = 'Qwen/Qwen3-8B'
     with pytest.raises(ValueError, match='teacher_model_path'):
         run_baseline.build_command(cfg, tmp_path, [])
+
+
+@pytest.mark.parametrize('recipe', ['qwen3_4b_crisp.yaml', 'qwen3_8b_crisp.yaml', 'qwen3_14b_crisp.yaml'])
+def test_crisp_recipes_pass_the_trainer_config_validation(monkeypatch, tmp_path, recipe):
+    from verl.utils.config import validate_config
+    monkeypatch.setattr(run_baseline, 'model_reference', lambda model, **kwargs: model)
+    monkeypatch.setattr(run_baseline, 'effective_model', lambda cfg: cfg['model_path'])
+    command = run_baseline.build_command(run_baseline.load_config(ROOT / 'configs' / recipe), tmp_path, [])
+    with hydra.initialize_config_dir(config_dir=str(ROOT / 'third_party/verl/verl/trainer/config'), version_base=None):
+        native = hydra.compose(config_name='ppo_trainer', overrides=command[3:])
+    validate_config(native, use_reference_policy=True, use_critic=False)  # what the trainer checks before building

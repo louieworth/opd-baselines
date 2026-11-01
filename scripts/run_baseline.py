@@ -550,6 +550,7 @@ def build_command(cfg: dict[str, Any], run_dir: Path, extra: list[str]) -> list[
         override("actor_rollout_ref.rollout.val_kwargs.top_p", float(cfg.get("val_top_p", 0.8))),
         override("actor_rollout_ref.rollout.val_kwargs.top_k", int(cfg.get("val_top_k", 20))),
         override("actor_rollout_ref.ref.log_prob_use_dynamic_bsz", True),
+        override("actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu", actor_micro_batch),
         override("actor_rollout_ref.ref.log_prob_max_token_len_per_gpu", train_max_seq),
         override("actor_rollout_ref.ref.fsdp_config.param_offload", True),
         override("actor_rollout_ref.ref.strategy", "fsdp2"),
